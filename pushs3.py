@@ -13,8 +13,7 @@ os.environ['AWS_ACCESS_KEY_ID'] = userdata.get('AWS_ACCESS_KEY_ID')
 os.environ['AWS_SECRET_ACCESS_KEY'] = userdata.get('AWS_SECRET_ACCESS_KEY')
 os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
 
-BUCKET = "my-bucket-name"
-
+BUCKET = "nickb-aarj" 
 s3 = boto3.client('s3')
 api = HfApi()
 
