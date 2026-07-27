@@ -1,4 +1,3 @@
-!pip install huggingface_hub boto3 pandas requests -q
 
 import os
 import shutil
