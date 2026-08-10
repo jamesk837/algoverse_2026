@@ -160,7 +160,6 @@ def push_github_repo_to_s3(github_url, s3_prefix):
 stream_repo_to_s3("INSAIT-Institute/ImplausiBench", "datasets/implausibench", repo_type="dataset")
 
 stream_url_dataset_to_s3("videophysics/videophy2_test", "datasets/videophy2_test", url_column="video_url")
-stream_url_dataset_to_s3("videophysics/videophy2_train", "datasets/videophy2_train", url_column="video_url")
 
 stream_repo_to_s3("Efficient-Large-Model/vila-ewm-qwen2-1.5b", "models/vila-ewm-qwen2-1.5b", repo_type="model")
 stream_repo_to_s3("videophysics/videophy_2_auto", "models/videophy_2_auto", repo_type="model")

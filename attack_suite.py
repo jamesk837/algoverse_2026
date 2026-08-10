@@ -1,24 +1,23 @@
-
-
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
 import cv2
 import numpy as np
-from google.colab import userdata
 
 BUCKET = "nickb-aarj"
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 VIDEO_SUFFIXES = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
 TMP_DIR = Path("./tmp_attacks")
+NUM_WORKERS = 4
 
 DATASET_PREFIXES = {
     "test": "datasets/videophy2_test/",
-    "train": "datasets/videophy2_train/",
     "implausibench_real": "datasets/implausibench/ImplausiBench/real/",
     "implausibench_implausible": "datasets/implausibench/ImplausiBench/implausible/",
 }
@@ -34,15 +33,34 @@ CAPTION_ECHO_CATEGORIES = {
 FREEZE_DURATION_FRACTION = 1.0 / 3.0
 FREEZE_POINT_RANGE = (0.40, 0.60)
 
-os.environ["AWS_ACCESS_KEY_ID"] = userdata.get("AWS_ACCESS_KEY_ID")
-os.environ["AWS_SECRET_ACCESS_KEY"] = userdata.get("AWS_SECRET_ACCESS_KEY")
-os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-s3 = boto3.client("s3")
+
+s3 = None
+
+
+def _ensure_s3():
+    global s3
+    if s3 is None:
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+        s3 = boto3.client("s3")
+    return s3
+
+
+def _init_worker():
+    _ensure_s3()
+
+
+def safe_local_name(name, max_len=80):
+    """some videophy2 filenames are derived from full captions and can run 100+ chars"""
+    stem, ext = os.path.splitext(name)
+    if len(stem) <= max_len:
+        return name
+    short = hashlib.sha256(stem.encode()).hexdigest()[:16]
+    return f"{stem[:max_len]}_{short}{ext}"
 
 
 def file_exists_in_s3(key):
     try:
-        s3.head_object(Bucket=BUCKET, Key=key)
+        _ensure_s3().head_object(Bucket=BUCKET, Key=key)
         return True
     except Exception:
         return False
@@ -50,7 +68,7 @@ def file_exists_in_s3(key):
 
 def list_source_videos(source_prefix, limit=None):
     keys = []
-    paginator = s3.get_paginator("list_objects_v2")
+    paginator = _ensure_s3().get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=BUCKET, Prefix=source_prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
@@ -100,50 +118,58 @@ def attack_reverse(inp, out):
     run_ffmpeg(inp, out, "reverse")
 
 
-def _write_frames_lossless(frames, fps, w, h, raw_out):
-    writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*"FFV1"), fps, (w, h))
-    if not writer.isOpened():
-        raise RuntimeError("FFV1 writer failed to open")
-    for f in frames:
-        writer.write(f)
-    writer.release()
-
-
 def attack_shuffle(inp, out, seed):
     cap = cv2.VideoCapture(inp)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    frames = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(frame)
-    cap.release()
-    if not frames:
-        raise RuntimeError("no frames")
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(frames))
-    h, w = frames[0].shape[:2]
 
-    raw_out = str(out).replace(".mp4", "_raw.avi")
-    _write_frames_lossless([frames[i] for i in order], fps, w, h, raw_out)
-    run_ffmpeg(raw_out, out)
-    os.remove(raw_out)
+    frame_dir = TMP_DIR / "frames" / f"shuffle_{os.getpid()}_{Path(inp).stem}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        count = 0
+        w = h = None
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if w is None:
+                h, w = frame.shape[:2]
+            np.save(frame_dir / f"{count:06d}.npy", frame)
+            count += 1
+        cap.release()
+
+        if count == 0:
+            raise RuntimeError("no frames")
+
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(count)
+
+        raw_out = str(out).replace(".mp4", "_raw.avi")
+        writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*"FFV1"), fps, (w, h))
+        if not writer.isOpened():
+            raise RuntimeError("FFV1 writer failed to open")
+
+        for i in order:
+            frame = np.load(frame_dir / f"{i:06d}.npy")
+            writer.write(frame)
+        writer.release()
+
+        run_ffmpeg(raw_out, out)
+        os.remove(raw_out)
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
 
 
 def attack_freeze(inp, out, seed):
     cap = cv2.VideoCapture(inp)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    frames = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(frame)
-    cap.release()
-    n = len(frames)
-    if n == 0:
-        raise RuntimeError("no frames")
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if n <= 0:
+        cap.release()
+        raise RuntimeError("could not determine frame count")
 
     rng = np.random.default_rng(seed)
     lo = int(n * FREEZE_POINT_RANGE[0])
@@ -153,16 +179,34 @@ def attack_freeze(inp, out, seed):
     freeze_len = max(1, round(n * FREEZE_DURATION_FRACTION))
     freeze_end = min(n, freeze_start + freeze_len)
 
-    frozen_frame = frames[freeze_start]
-    out_frames = list(frames)
-    for i in range(freeze_start, freeze_end):
-        out_frames[i] = frozen_frame
-
     print(f"    freeze: start={freeze_start} end={freeze_end} of {n} frames, fps={fps:.2f}")
 
-    h, w = frozen_frame.shape[:2]
     raw_out = str(out).replace(".mp4", "_raw.avi")
-    _write_frames_lossless(out_frames, fps, w, h, raw_out)
+    writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*"FFV1"), fps, (w, h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("FFV1 writer failed to open")
+
+    frozen_frame = None
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if freeze_start <= idx < freeze_end:
+            if frozen_frame is None:
+                frozen_frame = frame.copy()
+            writer.write(frozen_frame)
+        else:
+            writer.write(frame)
+        idx += 1
+    cap.release()
+    writer.release()
+
+    if frozen_frame is None:
+        os.remove(raw_out)
+        raise RuntimeError("freeze range was never reached (frame count mismatch)")
+
     run_ffmpeg(raw_out, out)
     os.remove(raw_out)
 
@@ -232,18 +276,19 @@ def process_one(dataset, source_key, attack_key, local_in):
         print(f"  skip (exists): {out_key}")
         return
 
-    local_out = TMP_DIR / "out" / f"{attack_key.replace(':', '_')}__{Path(source_key).name}"
+    safe_name = safe_local_name(Path(source_key).name)
+    local_out = TMP_DIR / "out" / f"{os.getpid()}__{attack_key.replace(':', '_')}__{safe_name}"
     local_out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"  running {attack_key} ...")
     meta = apply_attack(attack_key, str(local_in), str(local_out), source_key)
-    s3.upload_file(str(local_out), BUCKET, out_key)
+    _ensure_s3().upload_file(str(local_out), BUCKET, out_key)
     print(f"  uploaded -> s3://{BUCKET}/{out_key}")
     local_out.unlink(missing_ok=True)
 
     if meta is not None:
         meta_key = out_key + ".meta.json"
-        s3.put_object(
+        _ensure_s3().put_object(
             Bucket=BUCKET, Key=meta_key,
             Body=json.dumps(meta, indent=2).encode("utf-8"),
             ContentType="application/json",
@@ -251,7 +296,29 @@ def process_one(dataset, source_key, attack_key, local_in):
         print(f"  uploaded -> s3://{BUCKET}/{meta_key}")
 
 
-def run_suite(dataset="test", limit_clips=1):
+def process_clip(dataset, source_key, all_attacks):
+    print(f"\n=== {source_key} (pid={os.getpid()}) ===")
+
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_name = safe_local_name(Path(source_key).name)
+    local_in = TMP_DIR / "in" / f"{os.getpid()}__{safe_name}"
+    local_in.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[{source_key}] downloading source...")
+    _ensure_s3().download_file(BUCKET, source_key, str(local_in))
+
+    for attack_key in all_attacks:
+        try:
+            process_one(dataset, source_key, attack_key, local_in)
+        except Exception as e:
+            print(f"FAILED {source_key} {attack_key}: {e}")
+
+    local_in.unlink(missing_ok=True)
+    return source_key
+
+
+def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS):
     if dataset not in DATASET_PREFIXES:
         raise ValueError(f"dataset must be one of {list(DATASET_PREFIXES)}")
     source_prefix = DATASET_PREFIXES[dataset]
@@ -265,31 +332,30 @@ def run_suite(dataset="test", limit_clips=1):
     all_attacks = ["shuffle", "reverse", "freeze", "photometric"] + caption_echo_attacks
 
     already_done = sum(clip_fully_done(dataset, k, all_attacks) for k in source_keys)
-    print(f"dataset={dataset} limit_clips={limit_clips}")
+    todo = [k for k in source_keys if not clip_fully_done(dataset, k, all_attacks)]
+
+    print(f"dataset={dataset} limit_clips={limit_clips} num_workers={num_workers}")
     print(f"{len(source_keys)} clips selected, {already_done} already fully done, "
-          f"{len(source_keys) - already_done} to process\n")
+          f"{len(todo)} to process\n")
 
-    for source_key in source_keys:
-        if clip_fully_done(dataset, source_key, all_attacks):
-            print(f"=== {source_key} (already done, skipping download) ===")
-            continue
+    if not todo:
+        print("\nDone.")
+        return
 
-        print(f"\n=== {source_key} ===")
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        local_in = TMP_DIR / "in" / Path(source_key).name
-        local_in.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  downloading source ...")
-        s3.download_file(BUCKET, source_key, str(local_in))
-
-        for attack_key in all_attacks:
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker) as pool:
+        futures = {
+            pool.submit(process_clip, dataset, source_key, all_attacks): source_key
+            for source_key in todo
+        }
+        for future in as_completed(futures):
+            source_key = futures[future]
             try:
-                process_one(dataset, source_key, attack_key, local_in)
+                future.result()
             except Exception as e:
-                print(f"  FAILED {attack_key}: {e}")
-
-        local_in.unlink(missing_ok=True)
+                print(f"FAILED (clip-level) {source_key}: {e}")
 
     print("\nDone.")
 
 
-run_suite(dataset="implausibench_real", limit_clips=1)
+if __name__ == "__main__":
+    run_suite(dataset="implausibench_real", limit_clips=150)
