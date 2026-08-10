@@ -18,6 +18,7 @@ NUM_WORKERS = 4
 
 DATASET_PREFIXES = {
     "test": "datasets/videophy2_test/",
+    "train": "datasets/videophy2_train/",
     "implausibench_real": "datasets/implausibench/ImplausiBench/real/",
     "implausibench_implausible": "datasets/implausibench/ImplausiBench/implausible/",
 }
