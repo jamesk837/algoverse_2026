@@ -1,8 +1,10 @@
 __pycache__/
 CLAUDE.md
+README.md
 tmp_judge/
 tmp_attacks/
 tmp_download/
 tmp_github_repo/
 models_cache/
 failed_downloads.csv
+colab_check_*.py
