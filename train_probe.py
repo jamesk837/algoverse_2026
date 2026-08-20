@@ -19,6 +19,14 @@ N_THRESH = 4          # PC>1, PC>2, PC>3, PC>4
 N_PERT = 2            # perturbations per training clip, fixed in the split
 PC_LEVELS = (1, 2, 3, 4, 5)
 
+# val-only; never trained on, evaluated by within-clip delta
+TEMPORAL_VARIANTS = ("shuffle", "reverse", "freeze")
+
+
+def variant_kind(name):
+    return "temporal" if name in TEMPORAL_VARIANTS else "superficial"
+
+
 # both caches are live: the mean-pooled [1024] vectors are the baseline the
 # attentive probe gets compared against, on the same splits and the same code
 PACK_PREFIXES = {
@@ -42,7 +50,8 @@ DEFAULTS = dict(
     head="linear",      # linear | coral | corn
     logit_adjust=False,
     class_weight="inverse",  # none | inverse | sqrt_inverse
-    select="mae",       # mae | macro_mae | rho
+    select="macro_mae",  # mae | macro_mae | rho
+    n_boot=2000,        # bootstrap resamples for the per-variant CIs
     seed=0,
     eval_every=10,
 )
@@ -120,11 +129,8 @@ def build_train(pack, n_pert=N_PERT):
 
 
 def build_eval(pack):
-    """-> X_clean, y, {variant: (X, mask)}, stems.
-
-    Perturbations stay aligned to their clean clip so the invariance gap is
-    measured within-clip.
-    """
+    """-> X_clean, y, {variant: (X, mask)}, stems. Rows stay aligned to their
+    clean clip so deltas are within-clip."""
     grouped = group_by_stem(pack)
     stems = sorted(s for s in grouped if "clean" in grouped[s])
     X = pack["X"].astype(np.float32)
@@ -157,19 +163,14 @@ def _attentive_cls():
     if _ATTN_CLS is not None:
         return _ATTN_CLS
 
-    import math
     import torch
     import torch.nn as nn
 
     class OrdinalHead(nn.Module):
         """4 cumulative logits, P(PC>1)..P(PC>4).
 
-        'linear' is unconstrained, so nothing forces P(PC>1) >= P(PC>2) >= ...
-        'coral' shares one score and gives each threshold its own bias, so the
-        ordering follows from the biases coming out sorted. 'corn' keeps a free
-        Linear(d, 4) but reads it as conditional logits, P(PC>k | PC>k-1); the
-        cumulative probabilities are their running product, which cannot
-        increase.
+        linear: unconstrained. coral: one score plus a per-threshold bias.
+        corn: conditional logits P(PC>k | PC>k-1), cumulative via running product.
         """
 
         def __init__(self, d, kind="linear"):
@@ -188,11 +189,7 @@ def _attentive_cls():
 
     class AttentiveProbe(nn.Module):
         """LayerNorm -> 1024->256 -> learned temporal positions -> single-query
-        attentive pooling over the 32 moments -> ordinal head.
-
-        A physics violation is local in time, and mean pooling dilutes one bad
-        moment 32:1. The weights are inspectable through attention().
-        """
+        attentive pooling over the 32 moments -> ordinal head."""
 
         def __init__(self, cfg):
             super().__init__()
@@ -205,18 +202,14 @@ def _attentive_cls():
             self.query = nn.Parameter(torch.zeros(d))
             self.drop = nn.Dropout(cfg["dropout"])
             self.head = OrdinalHead(d, cfg.get("head", "linear"))
-            self.scale = 1.0 / math.sqrt(d)
-            nn.init.normal_(self.pos, std=0.02)
-            nn.init.normal_(self.query, std=0.02)
+            # a smaller scale/std flattens the softmax toward mean pooling
+            self.scale = 1.0
+            nn.init.normal_(self.pos, std=0.1)
+            nn.init.normal_(self.query, std=0.2)
             self._adjust = None
 
         def set_logit_adjust(self, vec):
-            """Undo the pos_weight shift at prediction time.
-
-            Training with pos_weight w_k shifts the logit-space optimum by
-            log(w_k), so the four sigmoids do not sum to a calibrated E[PC].
-            Eval only: in training it would just be absorbed into the bias.
-            """
+            """Subtract log(pos_weight) at prediction time. Eval only."""
             self._adjust = vec
 
         def _tokens(self, x):
@@ -229,6 +222,11 @@ def _attentive_cls():
         def attention(self, x):
             """(B, T) softmax weights over the moments, for diagnostics."""
             return ((self._tokens(x) @ self.query) * self.scale).softmax(-1)
+
+        def attention_entropy(self, x):
+            """(B,) entropy in nats. Uniform is log(T) = 3.466 at T=32."""
+            a = self.attention(x)
+            return -(a * a.clamp_min(1e-9).log()).sum(-1)
 
         def raw_logits(self, x):
             h = self._tokens(x)
@@ -302,12 +300,8 @@ def threshold_pos_weight(y):
 
 
 def clip_weights(y, kind="none"):
-    """Per-clip loss weight from PC frequency, normalised to mean 1.
-
-    The weight attaches to the clip, so its clean row and its two perturbed
-    rows share one; weighting rows would favour clips with more variants. This
-    stacks with threshold_pos_weight, which corrects a different imbalance.
-    """
+    """Per-clip loss weight from PC frequency, normalised to mean 1. Attaches
+    to the clip so its clean and perturbed rows share one weight."""
     import torch
     counts = torch.bincount(y, minlength=max(PC_LEVELS) + 1).float()
     per = counts[y].clamp(min=1.0)
@@ -368,12 +362,8 @@ def weighted_bce(bce_none, logits, targets, w):
 
 
 def set_dropout(model, active):
-    """Toggle only the Dropout layers, leaving the rest in train mode.
-
-    The consistency term needs dropout off: with it on the clean and perturbed
-    passes draw different masks and the penalty measures that noise, which was
-    ~13x the real signal at dropout=0.2.
-    """
+    """Toggle only the Dropout layers, leaving the rest in train mode. The
+    consistency term needs dropout off or it measures the mask difference."""
     import torch.nn as nn
     for mod in model.modules():
         if isinstance(mod, nn.Dropout):
@@ -382,8 +372,7 @@ def set_dropout(model, active):
 
 def consistency_loss(logits_a, logits_b, kind="mse"):
     """Distance between the clean and perturbed threshold probabilities.
-    Symmetric and not detached: the goal is that the two agree, not that one
-    chases the other."""
+    Symmetric and not detached, so neither side chases the other."""
     import torch
     pa, pb = torch.sigmoid(logits_a), torch.sigmoid(logits_b)
     if kind == "mse":
@@ -400,16 +389,83 @@ def consistency_loss(logits_a, logits_b, kind="mse"):
 
 # ----------------------------------------------------------------- eval
 
+def _rankdata(a):
+    """Midranks, so tied values share a rank. PC is an integer 1..5, so the
+    ties are large and argsort(argsort(x)) would break them arbitrarily."""
+    a = np.asarray(a, dtype=float)
+    n = len(a)
+    order = np.argsort(a, kind="mergesort")
+    sa = a[order]
+    ranks = np.empty(n, dtype=float)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sa[j + 1] == sa[i]:
+            j += 1
+        ranks[order[i:j + 1]] = 0.5 * (i + j) + 1.0   # 1-based midrank
+        i = j + 1
+    return ranks
+
+
 def _spearman(a, b):
-    """Underscored so eval_probe.spearman cannot shadow it when both files are
-    pasted into one notebook."""
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+    """Tie-corrected rho. Underscored so eval_probe.spearman cannot shadow it
+    when both files are pasted into one notebook."""
+    ra, rb = _rankdata(a), _rankdata(b)
+    if ra.std() == 0 or rb.std() == 0:
+        return float("nan")   # a constant prediction has no rank correlation
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
-def evaluate(model, clean, y, variants, device, batch=1024):
-    """-> dict with clean MAE and the per-variant invariance gap."""
+def _boot_ci(x, n_boot=2000, alpha=0.05, seed=0, stat=np.mean):
+    """Percentile bootstrap CI, resampling clips. Deltas are within-clip paired
+    differences, so the clip is the independent unit."""
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) < 2:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(x), size=(int(n_boot), len(x)))
+    draws = stat(x[idx], axis=1)
+    lo, hi = np.percentile(draws, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(lo), float(hi)
+
+
+def _cos_features(a, b):
+    """Per-clip cosine between clean and variant features. For the [32,1024]
+    packs this is the mean of the 32 per-moment cosines: moment t against
+    moment t, so a reorder in time shows up."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if a.ndim == 2:            # (N, D) mean-pooled packs
+        a, b = a[:, None, :], b[:, None, :]
+    num = (a * b).sum(-1)
+    den = (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1)) + 1e-8
+    return (num / den).mean(-1)
+
+
+def attention_stats(model, X, device, batch=1024):
+    """-> {mean, uniform, normalized, max_weight} or None for the mlp probe.
+    normalized is entropy / log(T); 1.00 is mean pooling."""
+    import torch
+    if not hasattr(model, "attention_entropy"):
+        return None
+    ents, maxes = [], []
+    with torch.no_grad():
+        for i in range(0, len(X), batch):
+            chunk = torch.as_tensor(X[i:i + batch], device=device)
+            ents.append(model.attention_entropy(chunk).cpu().numpy())
+            maxes.append(model.attention(chunk).max(dim=-1).values.cpu().numpy())
+    ent = float(np.concatenate(ents).mean())
+    t = int(X.shape[1])
+    uniform = float(np.log(t))
+    return {"mean": ent, "uniform": uniform, "normalized": ent / uniform,
+            "max_weight": float(np.concatenate(maxes).mean()),
+            "uniform_weight": 1.0 / t}
+
+
+def evaluate(model, clean, y, variants, device, batch=1024, n_boot=0, seed=0,
+             attn=True):
+    """-> dict with clean MAE / macro MAE / rho and per-variant delta stats.
+    Signed and absolute deltas both; n_boot>0 adds percentile CIs."""
     import torch
 
     model.eval()
@@ -433,19 +489,82 @@ def evaluate(model, clean, y, variants, device, batch=1024):
         macro_mae = float(np.mean(per_level)) if per_level else float("nan")
         rho = _spearman(pred_clean.cpu().numpy(), np.asarray(y, dtype=float))
 
-        gaps = {}
+        base = pred_clean.cpu().numpy()
+        gaps, signed, stats = {}, {}, {}
         for name, (rows, mask) in variants.items():
             if not mask.any():
                 continue
-            pred = score(rows)
-            m = torch.as_tensor(mask, device=device)
-            gaps[name] = (pred - pred_clean).abs()[m].mean().item()
+            d = (score(rows).cpu().numpy() - base)[mask]
+            cos = _cos_features(clean[mask], rows[mask])
+            gaps[name] = float(np.abs(d).mean())
+            signed[name] = float(d.mean())
+            row = {"kind": variant_kind(name), "n": int(mask.sum()),
+                   "signed": signed[name], "abs": gaps[name],
+                   "median_abs": float(np.median(np.abs(d))),
+                   "p95_abs": float(np.percentile(np.abs(d), 95)),
+                   "frac_over_half": float((np.abs(d) > 0.5).mean()),
+                   "cos": float(cos.mean()), "cos_min": float(cos.min())}
+            if n_boot:
+                row["signed_ci"] = _boot_ci(d, n_boot, seed=seed)
+                row["abs_ci"] = _boot_ci(np.abs(d), n_boot, seed=seed)
+                row["cos_ci"] = _boot_ci(cos, n_boot, seed=seed)
+            stats[name] = row
+
+        att = attention_stats(model, clean, device, batch) if attn else None
 
     model.train()
+
+    # mean_gap is the invariance measure, so temporal variants stay out of it
+    sup = [g for n, g in gaps.items() if variant_kind(n) == "superficial"]
+    tmp = [signed[n] for n in gaps if variant_kind(n) == "temporal"]
     return {"mae": mae, "rmse": rmse, "macro_mae": macro_mae, "rho": rho,
-            "gaps": gaps,
-            "mean_gap": float(np.mean(list(gaps.values()))) if gaps else 0.0,
-            "pred_clean": pred_clean.cpu().numpy()}
+            "gaps": gaps, "signed": signed, "variant_stats": stats,
+            "attention": att,
+            "mean_gap": float(np.mean(sup)) if sup else 0.0,
+            "mean_temporal_signed": float(np.mean(tmp)) if tmp else float("nan"),
+            "pred_clean": base}
+
+
+def print_variant_table(stats, indent="  "):
+    """Per-variant report grouped by taxonomy half. Shared by train() and
+    eval_probe.report()."""
+    if not stats:
+        return
+    order = {"temporal": 0, "superficial": 1}
+    groups = defaultdict(list)
+    for name, r in stats.items():
+        groups[r["kind"]].append((name, r))
+
+    print(f"{indent}{'perturbation':<40} {'n':>5} {'signed d':>9} "
+          f"{'95% CI':>18} {'mean|d|':>8} {'cos':>7}")
+    for kind in sorted(groups, key=lambda k: order.get(k, 9)):
+        want = ("scores should DROP: signed d < 0" if kind == "temporal"
+                else "scores should NOT MOVE: signed d ~ 0, and > 0 is inflation")
+        label = "sensitivity" if kind == "temporal" else "invariance"
+        print(f"{indent}-- expected-{label} ({want})")
+        for name, r in sorted(groups[kind]):
+            ci = r.get("signed_ci")
+            ci_s = f"[{ci[0]:+.3f}, {ci[1]:+.3f}]" if ci else ""
+            print(f"{indent}{name:<40} {r['n']:>5} {r['signed']:>+9.4f} "
+                  f"{ci_s:>18} {r['abs']:>8.4f} {r['cos']:>7.4f}")
+        if kind == "temporal":
+            n_ok = sum(1 for _, r in groups[kind]
+                       if r.get("signed_ci") and r["signed_ci"][1] < 0)
+            if any(r.get("signed_ci") for _, r in groups[kind]):
+                print(f"{indent}   {n_ok}/{len(groups[kind])} temporal "
+                      f"perturbations have a CI entirely below 0")
+        else:
+            bad = [n for n, r in groups[kind]
+                   if r.get("signed_ci") and r["signed_ci"][0] > 0]
+            if bad:
+                print(f"{indent}   INFLATION: CI entirely above 0 for "
+                      + ", ".join(sorted(bad)))
+
+
+def print_headline(m, indent="  ", label=""):
+    """MAE, macro MAE and rho side by side, whichever one is selecting."""
+    print(f"{indent}{label}mae {m['mae']:.4f}   macro_mae {m['macro_mae']:.4f} "
+          f"  rho {m['rho']:+.4f}")
 
 
 # ---------------------------------------------------------------- train
@@ -484,6 +603,14 @@ def train(device=None, verbose=True, packs=None, **overrides):
         counts = {p: int((y == p).sum()) for p in PC_LEVELS}
         print(f"  train {len(y)} clips {counts}")
         print(f"  val   {len(ev_y)} clips, {len(ev_variants)} perturbation types")
+        kinds = defaultdict(list)
+        for v in sorted(ev_variants):
+            kinds[variant_kind(v)].append(v)
+        for k in ("temporal", "superficial"):
+            if kinds[k]:
+                label = "sensitivity" if k == "temporal" else "invariance"
+                print(f"    expected-{label:<11} {len(kinds[k])}: "
+                      f"{', '.join(kinds[k])}")
 
     Xc = torch.as_tensor(Xc, device=device)
     Xp = torch.as_tensor(Xp, device=device)
@@ -576,27 +703,36 @@ def train(device=None, verbose=True, packs=None, **overrides):
             m = evaluate(model, ev_clean, ev_y, ev_variants, device)
             # train MAE separates underfitting from a weak signal: if it tracks
             # val, more capacity can help; if it is far below, it cannot
-            tr = evaluate(model, Xc, y, {}, device)
+            tr = evaluate(model, Xc, y, {}, device, attn=False)
             spread = float(m["pred_clean"].max() - m["pred_clean"].min())
+            att = m["attention"]
             row = {"epoch": epoch, "loss_clean": totals[0] / nb,
                    "loss_pert": totals[1] / nb, "loss_cons": totals[2] / nb,
                    "train_mae": tr["mae"], "val_mae": m["mae"],
                    "val_macro_mae": m["macro_mae"], "val_rho": m["rho"],
-                   "val_gap": m["mean_gap"], "val_spread": spread}
+                   "val_gap": m["mean_gap"],
+                   "val_temporal_signed": m["mean_temporal_signed"],
+                   "val_spread": spread,
+                   "attn_entropy": att["mean"] if att else None,
+                   "attn_entropy_norm": att["normalized"] if att else None}
             history.append(row)
             if verbose:
+                ent = (f"  H {att['mean']:.3f}/{att['uniform']:.3f} "
+                       f"({att['normalized']:.3f})" if att else "")
                 print(f"  epoch {epoch:>4}  clean {row['loss_clean']:.4f}  "
                       f"cons {row['loss_cons']:.5f}   train mae "
                       f"{tr['mae']:.4f}  val mae {m['mae']:.4f}  "
                       f"macro {m['macro_mae']:.4f}  rho {m['rho']:+.3f}  "
-                      f"gap {m['mean_gap']:.4f}  spread {spread:.2f}")
+                      f"gap {m['mean_gap']:.4f}  spread {spread:.2f}{ent}")
             # rho negated so one "lower is better" comparison covers all three
             score = -m["rho"] if cfg["select"] == "rho" else m[cfg["select"]]
             if score < best["score"]:
                 best = {"score": score, "mae": m["mae"], "rmse": m["rmse"],
                         "macro_mae": m["macro_mae"], "rho": m["rho"],
                         "mean_gap": m["mean_gap"], "gaps": m["gaps"],
-                        "epoch": epoch,
+                        "signed": m["signed"],
+                        "mean_temporal_signed": m["mean_temporal_signed"],
+                        "attention": att, "epoch": epoch,
                         "state": {k: v.detach().cpu().clone()
                                   for k, v in model.state_dict().items()}}
                 stale = 0
@@ -612,14 +748,42 @@ def train(device=None, verbose=True, packs=None, **overrides):
 
     secs = time.perf_counter() - t0
     ran = stopped or cfg["epochs"]
+
+    # rho is NaN on constant predictions and never beats inf, so best can be unset
+    unselected = "state" not in best
+    if unselected:
+        print(f"  WARNING no eval ever improved on the initial score (val "
+              f"{cfg['select']} was NaN, or the run was too short); keeping "
+              f"the last epoch's weights, which are NOT early-stopped")
+        best = {"score": float("nan"), "epoch": ran,
+                "state": {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}}
+
+    # CIs once, on the selected checkpoint
+    model.load_state_dict(best["state"])
+    final = evaluate(model, ev_clean, ev_y, ev_variants, device,
+                     n_boot=cfg["n_boot"], seed=cfg["seed"])
+    best["variant_stats"] = final["variant_stats"]
+    if unselected:
+        best.update({k: final[k] for k in
+                     ("mae", "rmse", "macro_mae", "rho", "mean_gap", "gaps",
+                      "signed", "mean_temporal_signed", "attention")})
+
     if verbose:
         print(f"\n  {ran} epochs in {secs:.1f}s ({secs/ran*1000:.0f} ms/epoch)"
               + ("" if stopped else "  [hit the epoch cap, not early stopping]"))
-        print(f"  best epoch {best['epoch']}: val mae {best['mae']:.4f}, "
-              f"macro mae {best['macro_mae']:.4f}, rho {best['rho']:+.3f}, "
-              f"mean invariance gap {best['mean_gap']:.4f}")
-        for name, g in sorted(best["gaps"].items()):
-            print(f"    {name:42s} {g:.4f}")
+        print(f"  best epoch {best['epoch']} (selected on val {cfg['select']})")
+        print_headline(best, indent="    ", label="val ")
+        print(f"    mean invariance gap (superficial only) "
+              f"{best['mean_gap']:.4f}")
+        att = best.get("attention")
+        if att:
+            print(f"    attention entropy {att['mean']:.3f} nats of a uniform "
+                  f"{att['uniform']:.3f} ({att['normalized']:.3f}); mean max "
+                  f"weight {att['max_weight']:.4f} vs uniform "
+                  f"{att['uniform_weight']:.4f}")
+        print()
+        print_variant_table(best["variant_stats"], indent="    ")
 
     return {"cfg": cfg, "best": best, "history": history, "epochs_run": ran,
             "early_stopped": stopped is not None,
@@ -634,7 +798,8 @@ def save_probe(result, name="probe_v1", push_to_s3=True):
         "cfg": result["cfg"],
         "val": {k: result["best"][k] for k in
                 ("mae", "rmse", "macro_mae", "rho", "mean_gap", "gaps",
-                 "epoch")},
+                 "signed", "mean_temporal_signed", "variant_stats",
+                 "attention", "epoch") if k in result["best"]},
         "history": result["history"],
         "embed_dim": EMBED_DIM,
         "n_thresh": N_THRESH,
@@ -654,8 +819,7 @@ def save_probe(result, name="probe_v1", push_to_s3=True):
 
 
 def push_probe(name="probe_v1"):
-    """Upload a probe already saved locally, so the normal flow can be train ->
-    save -> test -> push only if it is good."""
+    """Upload a probe already saved locally."""
     local = Path(f"./{name}.pt")
     if not local.exists():
         raise FileNotFoundError(f"{local} not found; run save_probe first")
@@ -666,9 +830,7 @@ def push_probe(name="probe_v1"):
 
 
 def sweep(lambdas=(0.0, 10.0, 100.0, 1000.0), device=None, **overrides):
-    """One training per lambda on shared packs. Too low leaves the probe
-    gameable, too high collapses it toward a constant, so read the mae column
-    and the gap column together."""
+    """One training per lambda on shared packs."""
     print("loading packs ...")
     packs = {s: load_pack(s) for s in ("train", "val")}
 
@@ -678,24 +840,31 @@ def sweep(lambdas=(0.0, 10.0, 100.0, 1000.0), device=None, **overrides):
         r = train(device=device, verbose=False, packs=packs,
                   lambda_cons=lam, **overrides)
         runs.append(r)
+        att = r["best"].get("attention")
         print(f"  val mae {r['best']['mae']:.4f}   "
               f"macro {r['best']['macro_mae']:.4f}   "
               f"rho {r['best']['rho']:+.3f}   "
               f"mean gap {r['best']['mean_gap']:.4f}   "
-              f"({r['seconds']:.1f}s)")
+              + (f"H {att['normalized']:.3f}   " if att else "")
+              + f"({r['seconds']:.1f}s)")
 
-    print(f"\n  {'lambda':>8} {'val mae':>9} {'macro':>9} {'rho':>7} {'mean gap':>9} {'epoch':>6}")
+    print(f"\n  {'lambda':>8} {'val mae':>9} {'macro':>9} {'rho':>7} "
+          f"{'sup gap':>9} {'temporal d':>11} {'H/logT':>7} {'epoch':>6}")
     for lam, r in zip(lambdas, runs):
-        print(f"  {lam:>8} {r['best']['mae']:>9.4f} "
-              f"{r['best']['macro_mae']:>9.4f} {r['best']['rho']:>+7.3f} "
-              f"{r['best']['mean_gap']:>9.4f} {r['best']['epoch']:>6}")
-    print("\n  pick the largest lambda that has not started to cost mae")
+        b = r["best"]
+        att = b.get("attention")
+        print(f"  {lam:>8} {b['mae']:>9.4f} {b['macro_mae']:>9.4f} "
+              f"{b['rho']:>+7.3f} {b['mean_gap']:>9.4f} "
+              f"{b.get('mean_temporal_signed', float('nan')):>+11.4f} "
+              + (f"{att['normalized']:>7.3f} " if att else f"{'-':>7} ")
+              + f"{b['epoch']:>6}")
     return runs
 
 
 if __name__ == "__main__" and not in_notebook():
     ap = argparse.ArgumentParser(description="train the ordinal PC probe")
-    for k in ("hidden", "batch_size", "epochs", "patience", "seed", "eval_every"):
+    for k in ("hidden", "batch_size", "epochs", "patience", "seed",
+              "eval_every", "n_boot"):
         ap.add_argument(f"--{k.replace('_', '-')}", type=int, default=None)
     for k in ("dropout", "lr", "weight_decay", "alpha", "lambda_cons"):
         ap.add_argument(f"--{k.replace('_', '-')}", type=float, default=None)

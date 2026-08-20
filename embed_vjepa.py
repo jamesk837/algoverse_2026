@@ -37,6 +37,11 @@ TMP_DIR = Path("./tmp_embed")
 
 SPLITS = ("train", "val", "cal")
 
+# val-only; already rendered by attack_suite, only the embeddings are missing.
+# Kept out of split_v1.json because a rebuild reshuffles train/val/cal and
+# would invalidate the cache.
+TEMPORAL_VARIANTS = ("shuffle", "reverse", "freeze")
+
 META_VARIANTS = "__variants__"
 META_FRAMES = "__n_frames__"
 
@@ -88,12 +93,19 @@ def load_split():
     return doc
 
 
-def variants_needed(entry, superficial):
+def variants_needed(entry, superficial, temporal=TEMPORAL_VARIANTS):
     if entry["split"] == "train":
         return ["clean"] + list(entry["train_perturbations"])
     if entry["split"] == "val":
-        return ["clean"] + list(superficial)
+        return ["clean"] + list(superficial) + list(temporal)
     return ["clean"]
+
+
+def temporal_variants(doc, enabled=True):
+    """A future split version can pin these; until then the constant is it."""
+    if not enabled:
+        return ()
+    return tuple(doc.get("val_temporal_variants") or TEMPORAL_VARIANTS)
 
 
 def video_key(doc, stem, variant):
@@ -116,7 +128,7 @@ def fmt_secs(s):
 
 
 def read_clip(path):
-    """Decode sequentially and return BGR frames; embed() does the conversion."""
+    """Decode sequentially and return BGR frames; embed() converts to RGB."""
     cap = cv2.VideoCapture(str(path))
     frames = []
     while True:
@@ -217,10 +229,7 @@ def embed(processor, encoder, frames, device="cuda"):
 
 def pool_tokens(tokens):
     """(1, T*S, D) -> (T, D): mean over the spatial tokens of each moment.
-
-    Assumes the encoder flattens tokens temporal-major. A spatial-major layout
-    reshapes just as cleanly, so verify_temporal_axis() is what checks it.
-    """
+    Assumes temporal-major flattening; verify_temporal_axis() checks that."""
     import torch
 
     if tokens.ndim != 3 or tokens.shape[0] != 1:
@@ -289,11 +298,8 @@ def verify_temporal_axis(processor, encoder, doc, device="cuda", n_clips=3):
 
 def compare_to_mean_pooled(stems=None, limit=20, old_prefix=None):
     """new.mean(axis=0) against the old mean-pooled cache, relative to scale.
-
-    Both average the same 18432 tokens, so this catches a bad reshape or a
-    changed preprocessor. It cannot catch a time/space swap: a mean is
-    order-invariant.
-    """
+    Catches a bad reshape or a changed preprocessor, but not a time/space swap
+    -- a mean is order-invariant."""
     old_prefix = old_prefix or f"embeddings/{HUB_MODEL}/train"
     doc = load_split()
     stems = stems or [s for s in sorted(doc["clips"])][:limit]
@@ -395,13 +401,11 @@ def download_video(key):
     return local
 
 
-def plan(doc, splits, limit=None, workers=CACHE_READ_WORKERS):
+def plan(doc, splits, limit=None, workers=CACHE_READ_WORKERS, temporal=True):
     """-> [(stem, [variants still needed])], already-cached ones excluded.
-
-    One LIST says which clips have a record at all; only those get read, and
-    those reads go out in parallel. A fresh run does zero GETs.
-    """
+    One LIST, then parallel GETs on only the clips that have a record."""
     superficial = doc["superficial_variants"]
+    temp = temporal_variants(doc, temporal)
     stems = [s for s in sorted(doc["clips"])
              if doc["clips"][s]["split"] in splits]
 
@@ -418,7 +422,7 @@ def plan(doc, splits, limit=None, workers=CACHE_READ_WORKERS):
         if limit and len(todo) >= limit:
             partial = True
             break
-        needed = variants_needed(doc["clips"][stem], superficial)
+        needed = variants_needed(doc["clips"][stem], superficial, temp)
         total += len(needed)
         have = contents.get(stem, {})
         missing = [v for v in needed if v not in have]
@@ -428,12 +432,17 @@ def plan(doc, splits, limit=None, workers=CACHE_READ_WORKERS):
     return todo, cached, total, partial
 
 
-def run(splits=SPLITS, limit=None, device="cuda", dry_run=False, push_to_s3=True):
+def run(splits=SPLITS, limit=None, device="cuda", dry_run=False,
+        push_to_s3=True, temporal=True):
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     doc = load_split()
 
+    temp = temporal_variants(doc, temporal)
     print(f"\nchecking cache for splits={list(splits)} ...")
-    todo, cached, total, partial = plan(doc, splits, limit)
+    if temp:
+        print(f"  val also gets the expected-sensitivity variants: "
+              f"{', '.join(temp)}")
+    todo, cached, total, partial = plan(doc, splits, limit, temporal=temporal)
 
     pending = sum(len(v) for _, v in todo)
     scope = f"first {total} scanned" if partial else f"{total} called for"
@@ -523,11 +532,14 @@ def run(splits=SPLITS, limit=None, device="cuda", dry_run=False, push_to_s3=True
     return results
 
 
-def consolidate(splits=SPLITS):
+def consolidate(splits=SPLITS, temporal=True):
     """Collapse the per-clip npz files into one array per split. Rows are
-    (stem, variant); a perturbed row carries its clean clip's label."""
+    (stem, variant); a perturbed row carries its clean clip's label. For the
+    temporal rows that label is wrong by construction -- nothing trains on
+    them, and the within-clip delta needs no label."""
     doc = load_split()
     superficial = doc["superficial_variants"]
+    temp = temporal_variants(doc, temporal)
 
     for split in splits:
         stems = sorted(s for s, e in doc["clips"].items() if e["split"] == split)
@@ -540,7 +552,7 @@ def consolidate(splits=SPLITS):
         for stem in stems:
             entry = doc["clips"][stem]
             have = fetched[stem][0]
-            for variant in variants_needed(entry, superficial):
+            for variant in variants_needed(entry, superficial, temp):
                 if variant not in have:
                     missing += 1
                     continue
@@ -595,10 +607,13 @@ if __name__ == "__main__" and not in_notebook():
                     help="confirm axis 0 of the pooled tensor is time")
     ap.add_argument("--compare-mean", action="store_true",
                     help="check new.mean(0) against the old mean-pooled cache")
+    ap.add_argument("--no-temporal", action="store_true",
+                    help="skip shuffle/reverse/freeze on val")
     args = ap.parse_args()
+    temporal = not args.no_temporal
 
     if args.consolidate:
-        consolidate(splits=args.splits)
+        consolidate(splits=args.splits, temporal=temporal)
     elif args.compare_mean:
         compare_to_mean_pooled(limit=args.limit or 20)
     elif args.verify_axis:
@@ -607,4 +622,5 @@ if __name__ == "__main__" and not in_notebook():
             proc, enc, load_split(), args.device) else 1)
     else:
         run(splits=args.splits, limit=args.limit, device=args.device,
-            dry_run=args.dry_run, push_to_s3=not args.no_push)
+            dry_run=args.dry_run, push_to_s3=not args.no_push,
+            temporal=temporal)
