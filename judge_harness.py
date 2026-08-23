@@ -3,16 +3,25 @@ import os
 from pathlib import Path
 
 import boto3
-from google.colab import userdata
 
-os.environ['AWS_ACCESS_KEY_ID'] = userdata.get('AWS_ACCESS_KEY_ID')
-os.environ['AWS_SECRET_ACCESS_KEY'] = userdata.get('AWS_SECRET_ACCESS_KEY')
-os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
-
+# Colab supplies credentials through userdata; everywhere else (EC2, local)
+# boto3's ambient chain does, so the import must not be at module scope the way
+# pushs3.py's is -- that is what made this file Colab-only. setdefault, not
+# assignment, so an instance role's own region is not overwritten. The region
+# has to land before the client below is built.
 try:
-    os.environ['HF_TOKEN'] = userdata.get('HF_TOKEN')
-except Exception:
-    print("no HF_TOKEN secret; phyjudge_9b base model must be public or cached")
+    from google.colab import userdata
+except ImportError:
+    userdata = None
+
+if userdata is not None:
+    os.environ['AWS_ACCESS_KEY_ID'] = userdata.get('AWS_ACCESS_KEY_ID')
+    os.environ['AWS_SECRET_ACCESS_KEY'] = userdata.get('AWS_SECRET_ACCESS_KEY')
+    try:
+        os.environ['HF_TOKEN'] = userdata.get('HF_TOKEN')
+    except Exception:
+        print("no HF_TOKEN secret; phyjudge_9b base model must be public or cached")
+os.environ.setdefault('AWS_DEFAULT_REGION', 'us-east-1')
 
 BUCKET = "nickb-aarj"
 s3 = boto3.client('s3')
