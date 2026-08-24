@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import boto3
@@ -195,6 +196,41 @@ def list_source_videos(dataset, limit=None):
     keys = [k for k, _ in list_keys(DATASET_PREFIXES[dataset], VIDEO_SUFFIXES)]
     keys.sort()
     return keys[:limit] if limit else keys
+
+
+def fmt_secs(s):
+    s = int(s)
+    if s >= 3600:
+        return f"{s//3600}h{(s%3600)//60:02d}m"
+    if s >= 60:
+        return f"{s//60}m{s%60:02d}s"
+    return f"{s}s"
+
+
+def shard_keys(keys, shard):
+    """Take this worker's stripe of `keys`, as (index, count).
+
+    Nothing in the harness parallelizes on its own: the loop is one generate()
+    at a time, and device_map="auto" shards a model across GPUs rather than
+    replicating it, so extra GPUs on one box add nothing by themselves. The work
+    is embarrassingly parallel at the clip level instead -- checkpointing is per
+    (clip, variant, call) in S3, so disjoint stripes never touch the same result
+    key and need no coordination. One process per GPU (CUDA_VISIBLE_DEVICES=i)
+    or one per instance both work.
+
+    Striped (keys[i::n]) rather than contiguous blocks: clip cost varies with
+    duration and consecutive keys sort together by filename, so blocks would
+    hand one worker a run of long clips. list_source_videos sorts explicitly, so
+    every worker stripes an identical list without talking to the others.
+    """
+    if shard is None:
+        return keys
+    index, count = shard
+    if not (isinstance(index, int) and isinstance(count, int)):
+        raise ValueError(f"shard must be (index, count) ints, got {shard!r}")
+    if count < 1 or not (0 <= index < count):
+        raise ValueError(f"shard index must satisfy 0 <= {index} < {count}")
+    return keys[index::count]
 
 
 def sync_prefix(prefix, dest):
@@ -528,6 +564,13 @@ def refresh_unparsed(record):
 
 
 def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
+    """Score one clip's outstanding calls. Returns (record, calls_attempted).
+
+    The count is attempts, not successes: a call that raises still consumed
+    model time, so it belongs in the rate. Calls skipped because a variant was
+    never rendered are *not* counted -- they cost nothing and run_judges takes
+    them back off the pending total instead.
+    """
     key = result_key(judge.name, dataset, source_key)
     record = get_json(key) or {
         "model": judge.name, "dataset": dataset, "clip": Path(source_key).stem,
@@ -535,6 +578,7 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
     }
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
+    calls_run = 0
     for variant, call_ids in items:
         video_key = video_key_for(dataset, source_key, variant)
         if not key_exists(video_key):
@@ -546,6 +590,7 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
             run = record["runs"].setdefault(
                 variant, {"video_key": video_key, "caption": caption, "calls": {}})
             for call_id in call_ids:
+                calls_run += 1
                 try:
                     raw, parsed = judge.run(local, caption, call_id)
                     run["calls"][call_id] = {"raw": raw, "parsed": parsed}
@@ -562,7 +607,7 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
     if push_to_s3:
         put_json(key, record)
         print(f"  -> s3://{BUCKET}/{key}")
-    return record
+    return record, calls_run
 
 
 def results_frame(records):
@@ -602,7 +647,7 @@ def show_results(df):
 
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
-               rebuild_captions=False, show=None):
+               rebuild_captions=False, show=None, shard=None):
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
@@ -613,13 +658,20 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     if not source_keys:
         print("no source videos found")
         return results_frame([])
+    # After the limit, never before: the stripes then cover exactly the clips a
+    # single unsharded run of the same num_clips would have taken.
+    if shard is not None:
+        total = len(source_keys)
+        source_keys = shard_keys(source_keys, shard)
+        print(f"shard {shard[0]}/{shard[1]}: {len(source_keys)} of {total} clips")
 
     records = []
     for model in models:
         judge = JUDGES[model]()
         call_ids = judge.call_ids()
+        shard_note = f", shard={shard[0]}/{shard[1]}" if shard else ""
         print(f"\n########## {judge.name} (dataset={dataset}, clips={num_clips}, "
-              f"calls/variant={len(call_ids)}, push={push_to_s3}) ##########")
+              f"calls/variant={len(call_ids)}, push={push_to_s3}{shard_note}) ##########")
 
         todo, done_records, skipped = [], [], 0
         for source_key in source_keys:
@@ -641,6 +693,9 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
         if not todo:
             continue
 
+        pending = sum(len(cids) for _, _, items in todo for _, cids in items)
+        print(f"{pending} generations to run")
+
         try:
             print(f"[{judge.name}] loading")
             judge.load()
@@ -648,14 +703,38 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
             print(f"[{judge.name}] SKIPPED: {e}")
             continue
 
+        # after load(): weight download and model init are one-off and would
+        # otherwise poison the per-call rate for the whole run
+        t_start = time.perf_counter()
+        done_calls = 0
+
         for i, (source_key, caption, items) in enumerate(todo, 1):
             print(f"\n=== [{i}/{len(todo)}] {source_key} ===")
+            planned = sum(len(c) for _, c in items)
             try:
-                records.append(process_clip(judge, dataset, source_key, caption,
-                                            items, push_to_s3))
+                record, ran = process_clip(judge, dataset, source_key, caption,
+                                           items, push_to_s3)
+                records.append(record)
             except Exception as e:
+                ran = 0
                 print(f"FAILED (clip-level) {source_key}: {e}")
 
+            done_calls += ran
+            # Calls that never ran -- a dead clip, or a variant that was never
+            # rendered -- come off the total rather than counting as done, so
+            # the remaining count stays honest and the rate stays real.
+            pending -= planned - ran
+            elapsed = time.perf_counter() - t_start
+            rate = elapsed / done_calls if done_calls else 0.0
+            eta = max(pending - done_calls, 0) * rate
+            print(f"[{i:>4}/{len(todo)}] {ran}/{planned} calls  "
+                  f"{done_calls:>6}/{pending}  {rate:5.1f}s/call  "
+                  f"elapsed {fmt_secs(elapsed)}  eta {fmt_secs(eta)}  "
+                  f"{Path(source_key).stem[:40]}")
+
+        total = time.perf_counter() - t_start
+        print(f"[{judge.name}] {done_calls} generations in {fmt_secs(total)}"
+              + (f" ({total/done_calls:.1f}s/call)" if done_calls else ""))
         del judge
 
     df = results_frame(records)
