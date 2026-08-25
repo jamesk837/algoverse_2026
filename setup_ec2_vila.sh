@@ -70,7 +70,7 @@ export PIP_CONSTRAINT="$CONSTRAINTS"
 "$PY" -m pip install -q transformers==4.46.0 accelerate==0.34.2
 "$PY" -m pip install -q boto3 pandas sentencepiece protobuf einops timm \
   opencv-python pillow safetensors loguru hydra-core omegaconf termcolor \
-  shortuuid einops-exts pytorchvideo decord openpyxl markdown2 scikit-learn httpx datasets
+  shortuuid einops-exts pytorchvideo decord openpyxl markdown2 scikit-learn httpx datasets matplotlib
 "$PY" -m pip install -q deepspeed
 "$PY" -m pip install -q git+https://github.com/bfshi/scaling_on_scales.git
 # belt and braces: PIP_CONSTRAINT should already have held numpy down, and the

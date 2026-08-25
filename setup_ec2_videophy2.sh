@@ -54,6 +54,10 @@ PY="$VENV/bin/python"
 # is wrapped in a try/except -- the "install flash-attn first." line it prints
 # is expected and harmless.
 "$PY" -m pip install -q einops pillow
+# the judge loads with device_map={"": "cpu"}, which transformers routes
+# through accelerate. Held below 1.0: transformers 4.28 imports helpers from
+# accelerate.utils that the 1.x line moved, and --no-deps means nothing pins it.
+"$PY" -m pip install -q 'accelerate<1.0'
 "$PY" -m pip install -q decord sentencepiece protobuf boto3 pandas
 
 # relax the runtime version table that --no-deps just bypassed
@@ -106,6 +110,7 @@ print("-" * 70)
 import torch
 check("torch", lambda: f"{torch.__version__}, cuda={torch.cuda.is_available()}")
 check("gpu", lambda: torch.cuda.get_device_name(0))
+check("accelerate", lambda: importlib.import_module("accelerate").__version__)
 check("einops", lambda: importlib.import_module("einops").__version__)
 check("PIL", lambda: importlib.import_module("PIL").__version__)
 check("decord", lambda: getattr(importlib.import_module("decord"), "__version__", "imported"))
