@@ -163,6 +163,15 @@ run_judges(dataset='$DATASET', num_clips=$N, models=['$judge'], shard=($IDX, $CO
     echo "     WARN non-zero exit"
     status=1
   fi
+  # run_judges catches a load failure, prints "[judge] SKIPPED: <reason>" and
+  # returns normally -- so the exit code is 0, no FAILED line is emitted, and a
+  # judge that scored nothing at all would otherwise be reported as fine. On an
+  # unattended multi-day fleet run that is the worst possible silent failure.
+  if grep -q "SKIPPED:" "$log"; then
+    echo "     DID NOT RUN: the judge failed to load and scored nothing:"
+    sed -n 's/.*SKIPPED: */       /p' "$log" | head -3
+    status=1
+  fi
   if grep -q "meta device" "$log"; then
     echo "     VOID: 'meta device' in the log -- the adapter did not load and"
     echo "           these scores came from the bare base model. Delete them:"

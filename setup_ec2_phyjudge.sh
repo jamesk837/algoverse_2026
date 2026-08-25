@@ -30,7 +30,9 @@ fi
 PY="$VENV/bin/python"
 "$PY" -m pip install -q --upgrade pip
 
-"$PY" -m pip install -q torch
+# torchvision is not optional: Qwen3VLVideoProcessor refuses to construct
+# without it, and the failure lands at judge load, not at install.
+"$PY" -m pip install -q torch torchvision
 "$PY" -m pip install -q transformers accelerate peft pyyaml boto3 pandas
 # separate requirements on purpose: the qwen-vl-utils[decord] extra fails to
 # resolve and silently takes the whole package with it

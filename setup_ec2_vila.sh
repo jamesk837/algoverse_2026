@@ -47,7 +47,22 @@ REWRITE
 PY="$VENV/bin/python"
 "$PY" -m pip install -q --upgrade pip
 
-"$PY" -m pip install -q torch
+# numpy<2 is constrained for EVERY install below, not pinned afterwards. VILA
+# needs 1.26.4, and installing it last -- the previous approach -- let pip
+# resolve scipy, pandas and friends against numpy 2.x first, then yanked numpy
+# out from under them. That surfaced as deepspeed failing to import with
+# "module 'numpy' has no attribute 'long'": scipy's source uses np.long, which
+# exists in numpy 2 and not in 1.26. With the constraint in place pip picks a
+# scipy that matches from the start, so nothing is left stranded.
+CONSTRAINTS="$VENV/numpy-constraint.txt"
+mkdir -p "$VENV"
+echo "numpy<2" > "$CONSTRAINTS"
+export PIP_CONSTRAINT="$CONSTRAINTS"
+
+# torchvision and datasets are both reached by llava.load(), not by
+# `import llava` -- which is why the verify block passes and the judge then
+# fails at load time with ModuleNotFoundError.
+"$PY" -m pip install -q torch torchvision
 # --no-deps: VILA's pyproject pins gradio==3.35.2, which drags pydantic<2 and
 # makes the resolve impossible. gradio/bitsandbytes/flash-attn are demo-or-kernel
 # deps that inference never touches.
@@ -55,10 +70,11 @@ PY="$VENV/bin/python"
 "$PY" -m pip install -q transformers==4.46.0 accelerate==0.34.2
 "$PY" -m pip install -q boto3 pandas sentencepiece protobuf einops timm \
   opencv-python pillow safetensors loguru hydra-core omegaconf termcolor \
-  shortuuid einops-exts pytorchvideo decord openpyxl markdown2 scikit-learn httpx
+  shortuuid einops-exts pytorchvideo decord openpyxl markdown2 scikit-learn httpx datasets
 "$PY" -m pip install -q deepspeed
 "$PY" -m pip install -q git+https://github.com/bfshi/scaling_on_scales.git
-# last, so nothing above can bump it back up
+# belt and braces: PIP_CONSTRAINT should already have held numpy down, and the
+# verify block below hard-fails if it did not
 "$PY" -m pip install -q 'numpy<2'
 
 SITE="$("$PY" -c 'import site; print(site.getsitepackages()[0])')"
