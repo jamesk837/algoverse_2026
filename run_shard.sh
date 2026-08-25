@@ -70,18 +70,40 @@ done
 # All venvs are built before any judge runs. Lazily building each one just
 # before its judge would hide a broken vila setup behind phyjudge's ~40 hours;
 # ten minutes up front buys fail-fast on all three.
+# A venv DIRECTORY existing is not the same as a venv being usable, and
+# treating it as such has now failed twice: once on venvs left half-built by a
+# crashed setup, and once on venvs created against Python 3.14 before the
+# interpreter problem was understood. Both had bin/python and neither could run
+# a judge -- the second surfaced as a confusing "no AWS credentials" much later,
+# because the preflight ran boto3 out of a venv that had never been populated.
+# So: check the interpreter version, and check a package every setup script
+# installs actually imports.
+venv_healthy() {
+  local venv="$1"
+  [ -x "$venv/bin/python" ] || return 1
+  "$venv/bin/python" - <<'HEALTH' >/dev/null 2>&1 || return 1
+import sys
+assert (3, 10) <= sys.version_info[:2] <= (3, 12), sys.version
+import boto3   # every setup_ec2_*.sh installs it; absent => setup never finished
+HEALTH
+}
+
 for judge in $JUDGES; do
   venv="$(venv_for "$judge")"
-  if [ -x "$venv/bin/python" ]; then
+  if venv_healthy "$venv"; then
     echo "venv ok: $venv"
     continue
   fi
-  [ -z "${SKIP_SETUP:-}" ] || die "no venv at $venv and SKIP_SETUP is set"
+  [ -z "${SKIP_SETUP:-}" ] || die "venv at $venv is missing or unusable, and SKIP_SETUP is set"
   script="$(setup_for "$judge")"
   [ -x "$script" ] || die "$script missing or not executable"
+  if [ -d "$venv" ]; then
+    echo "venv at $venv is unusable (wrong Python, or setup never finished) -- rebuilding"
+    rm -rf "$venv"
+  fi
   echo "building venv for $judge ($script) ..."
   VENV="$venv" "$script" || die "$script failed -- fix it before running $judge"
-  [ -x "$venv/bin/python" ] || die "$script finished but $venv/bin/python is absent"
+  venv_healthy "$venv" || die "$script finished but $venv is still not usable"
 done
 
 case "$JUDGES" in
