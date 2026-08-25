@@ -207,6 +207,29 @@ def fmt_secs(s):
     return f"{s}s"
 
 
+def clips_with_attacks(dataset):
+    """Stems that have a rendered variant directory under attacks/<dataset>/.
+
+    A clip whose variants were never rendered still has a `clean` (it is the
+    source object), so the harness would happily score it -- 16 phyjudge calls
+    -- and then print `missing video` nine times. That is pure cost: every
+    measurement in this project is a within-clip delta between clean and a
+    variant, so a clip with no variants contributes nothing. It also leaves a
+    permanently-incomplete record in results/pass1.
+
+    Delimiter="/" makes this one cheap LIST returning a common prefix per clip,
+    rather than an object listing of every rendered variant.
+    """
+    prefix = f"attacks/{dataset}/"
+    stems, paginator = set(), s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            stem = cp["Prefix"][len(prefix):].strip("/")
+            if stem:
+                stems.add(stem)
+    return stems
+
+
 def shard_keys(keys, shard):
     """Take this worker's stripe of `keys`, as (index, count).
 
@@ -647,17 +670,32 @@ def show_results(df):
 
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
-               rebuild_captions=False, show=None, shard=None):
+               rebuild_captions=False, show=None, shard=None,
+               require_attacks=True):
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
     show = (not push_to_s3) if show is None else show
 
     captions = build_caption_manifest(dataset, rebuild=rebuild_captions)
-    source_keys = list_source_videos(dataset, limit=num_clips)
+    source_keys = list_source_videos(dataset)
     if not source_keys:
         print("no source videos found")
         return results_frame([])
+
+    # Filter BEFORE the num_clips limit, so num_clips counts clips that can
+    # actually be scored rather than positions in the raw listing.
+    if require_attacks:
+        have = clips_with_attacks(dataset)
+        before = len(source_keys)
+        source_keys = [k for k in source_keys if Path(k).stem in have]
+        print(f"{len(source_keys)} of {before} source clips have rendered attacks"
+              f" ({before - len(source_keys)} skipped;"
+              f" pass require_attacks=False to score them clean-only)")
+        if not source_keys:
+            print(f"nothing under attacks/{dataset}/ - run attack_suite first")
+            return results_frame([])
+    source_keys = source_keys[:num_clips] if num_clips else source_keys
     # After the limit, never before: the stripes then cover exactly the clips a
     # single unsharded run of the same num_clips would have taken.
     if shard is not None:
