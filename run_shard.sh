@@ -18,6 +18,8 @@
 #   VENVS=$HOME/venvs
 #   LOGS=$HOME/logs
 #   SKIP_SETUP=1     assume the venvs exist instead of building missing ones
+#   PYTHON=python3.12  interpreter the venvs are built from; the pins need
+#                    3.10-3.12, so this is required wherever python3 is newer
 #
 # Smoke test -- one clip through all three judges, written to S3 so it can be
 # inspected from Colab with check_results.py:

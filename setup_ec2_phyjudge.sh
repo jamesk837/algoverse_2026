@@ -3,13 +3,30 @@
 
 VENV="${VENV:-$HOME/venvs/phyjudge}"
 
+PYBIN="${PYTHON:-python3}"
+command -v "$PYBIN" >/dev/null || { echo "no such interpreter: $PYBIN"; exit 1; }
+# Fail here, not five minutes into a Rust build. These stacks pin packages whose
+# newest wheels are 3.12: numpy<2 (vila) stops at 3.12, and transformers 4.28.1's
+# tokenizers needs PyO3, which caps at 3.13. torch sets the 3.10 floor.
+"$PYBIN" - <<'VERCHECK' || exit 1
+import sys
+lo, hi = (3, 10), (3, 12)
+v = sys.version_info[:2]
+if not (lo <= v <= hi):
+    print(f"  FAIL  {sys.executable} is Python {v[0]}.{v[1]}; these pins need "
+          f"{lo[0]}.{lo[1]}-{hi[0]}.{hi[1]}.")
+    print("        Install one and re-run with:  PYTHON=python3.12 $0")
+    raise SystemExit(1)
+print(f"  using Python {v[0]}.{v[1]} at {sys.executable}")
+VERCHECK
+
 if [ -z "${SKIP_APT:-}" ]; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq python3-venv python3-dev build-essential git \
     ffmpeg libgl1 libglib2.0-0
 fi
 
-[ -d "$VENV" ] || python3 -m venv "$VENV"
+[ -d "$VENV" ] || "$PYBIN" -m venv "$VENV"
 PY="$VENV/bin/python"
 "$PY" -m pip install -q --upgrade pip
 
