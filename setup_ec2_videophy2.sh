@@ -34,6 +34,20 @@ PY="$VENV/bin/python"
 "$PY" -m pip install -q torch
 # --no-deps: the tokenizers<0.14 pin has no wheel for modern Python
 "$PY" -m pip install -q --no-deps transformers==4.28.1
+# --no-deps skipped transformers' own requirements, so they go in by hand. Colab
+# had all of these preinstalled, which is why this was never needed there and a
+# clean venv dies on `import transformers` with ModuleNotFoundError: packaging.
+# Two are deliberately unpinned against what 4.28.1 asks for:
+#   tokenizers  -- 4.28.1 wants <0.14, which has no wheel for modern Python and
+#     falls back to a Rust build that fails (PyO3 caps at 3.13). A current
+#     tokenizers only has to exist to satisfy the import-time version check:
+#     videophy2 uses the sentencepiece-based LlamaTokenizer, never the fast one.
+#   huggingface-hub -- capped below 1.0 because transformers 4.28 imports
+#     HfFolder and friends at module scope, and 1.0 removed them. Nothing here
+#     touches the Hub at runtime (the model is a local path), but the import
+#     still has to resolve.
+# The version-table patch below is what stops the relaxed pins being rejected.
+"$PY" -m pip install -q filelock "huggingface-hub<1.0" packaging pyyaml regex   requests tqdm tokenizers
 "$PY" -m pip install -q decord sentencepiece protobuf boto3 pandas
 
 # relax the runtime version table that --no-deps just bypassed
