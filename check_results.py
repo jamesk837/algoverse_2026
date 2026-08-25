@@ -48,6 +48,7 @@ VARIANTS = [
 ]
 TEMPORAL = {"shuffle", "reverse", "freeze"}
 JUDGE_NAMES = ["vila_ewm", "videophy2_auto", "phyjudge_9b"]
+DATASETS = ["test", "implausibench_real", "implausibench_implausible"]
 CALLS_EXPECTED = {"vila_ewm": 8, "videophy2_auto": 2, "phyjudge_9b": 16}
 
 
@@ -169,8 +170,17 @@ def check(dataset="test", models=None, clip=None, show_raw=False):
     return df
 
 
-def coverage(dataset="test", models=None):
-    """How many clips each judge has finished, and how many are only partial."""
+def coverage(dataset=None, models=None):
+    """How many clips each judge has finished, and how many are only partial.
+
+    Covers all three phase-1 corpora by default, matching what run_shard.sh
+    runs; pass a single dataset name to narrow it.
+    """
+    if dataset is None:
+        for ds in DATASETS:
+            print(f"\n== {ds} ==")
+            coverage(dataset=ds, models=models)
+        return
     models = models or JUDGE_NAMES
     for model in models:
         keys = _list(f"{RESULT_PREFIX}/{model}/{dataset}/")
@@ -218,7 +228,8 @@ if __name__ == "__main__" and not in_notebook():
     import argparse
 
     ap = argparse.ArgumentParser(description="inspect Pass-1 results in S3")
-    ap.add_argument("--dataset", default="test")
+    ap.add_argument("--dataset", default=None,
+                    help="one of %s; default: all three for --coverage" % DATASETS)
     ap.add_argument("--clip", default=None, help="one clip stem")
     ap.add_argument("--models", nargs="*", default=None)
     ap.add_argument("--raw", action="store_true", help="print raw outputs too")
@@ -228,4 +239,4 @@ if __name__ == "__main__" and not in_notebook():
     if a.coverage:
         coverage(dataset=a.dataset, models=a.models)
     else:
-        check(dataset=a.dataset, models=a.models, clip=a.clip, show_raw=a.raw)
+        check(dataset=a.dataset or "test", models=a.models, clip=a.clip, show_raw=a.raw)

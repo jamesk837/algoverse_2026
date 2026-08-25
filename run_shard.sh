@@ -12,8 +12,8 @@
 # in a live interpreter is what produces the silent meta-device corruption).
 #
 # env overrides:
-#   N=590            clip count (default: ask S3)
-#   DATASET=test     test | implausibench_real | implausibench_implausible
+#   N=590            cap clips per dataset (default: all of them)
+#   DATASETS="..."   space-separated, in order; default is all three
 #   JUDGES="..."     space-separated subset, in order
 #   VENVS=$HOME/venvs
 #   LOGS=$HOME/logs
@@ -30,7 +30,10 @@ cd "$(dirname "$0")"
 
 IDX="${1:-}"
 COUNT="${2:-8}"
-DATASET="${DATASET:-test}"
+# All three phase-1 corpora by default. One process per (judge, dataset): a
+# second model load in a live interpreter is what produces the silent
+# meta-device corruption, so they cannot share one.
+DATASETS="${DATASETS:-${DATASET:-test implausibench_real implausibench_implausible}}"
 JUDGES="${JUDGES:-phyjudge_9b vila_ewm videophy2_auto}"
 VENVS="${VENVS:-$HOME/venvs}"
 LOGS="${LOGS:-$HOME/logs}"
@@ -119,18 +122,21 @@ import boto3
 boto3.client('sts', region_name='us-east-1').get_caller_identity()" \
   || die "no AWS credentials -- is the IAM instance profile attached?"
 
-if [ -z "${N:-}" ]; then
-  echo "counting clips in $DATASET ..."
-  N="$("$FIRST_VENV/bin/python" -c "
-from judge_harness import list_source_videos
-print(len(list_source_videos('$DATASET')))")" || die "could not list source videos"
+# Left to run_judges: it filters to clips that actually have rendered attacks
+# and prints the real count per dataset, which a bare listing count would
+# misreport (videophy2_test lists 1638 objects for ~450 usable clips).
+if [ -n "${N:-}" ]; then
+  case "$N" in *[!0-9]*) die "bad clip count: '$N'" ;; esac
+  NUM_CLIPS="$N"
+else
+  NUM_CLIPS=None
 fi
-case "$N" in ''|*[!0-9]*) die "bad clip count: '$N'" ;; esac
 
 mkdir -p "$LOGS"
 echo "======================================================================"
-echo "shard $IDX/$COUNT   dataset=$DATASET   clips=$N"
-echo "judges: $JUDGES"
+echo "shard $IDX/$COUNT   clips/dataset=${N:-all}"
+echo "datasets: $DATASETS"
+echo "judges:   $JUDGES"
 echo "logs:   $LOGS"
 echo "======================================================================"
 
@@ -141,21 +147,22 @@ total_failed=0
 
 for judge in $JUDGES; do
   venv="$(venv_for "$judge")"
-  log="$LOGS/${judge}_${IDX}.log"
+  for ds in $DATASETS; do
+  log="$LOGS/${judge}_${ds}_${IDX}.log"
   echo
-  echo "---- $judge  ($(date '+%F %T'))  -> $log"
+  echo "---- $judge / $ds  ($(date '+%F %T'))  -> $log"
   t0=$(date +%s)
 
   # -u or a detached log stays empty until the buffer flushes
   "$venv/bin/python" -u -c "
 from judge_harness import run_judges
-run_judges(dataset='$DATASET', num_clips=$N, models=['$judge'], shard=($IDX, $COUNT))
+run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, $COUNT))
 " 2>&1 | tee "$log"
   rc="${PIPESTATUS[0]}"
 
   secs=$(( $(date +%s) - t0 ))
-  printf -- '---- %s finished in %dh%02dm (exit %s)\n' \
-    "$judge" $((secs/3600)) $(((secs%3600)/60)) "$rc"
+  printf -- '---- %s / %s finished in %dh%02dm (exit %s)\n' \
+    "$judge" "$ds" $((secs/3600)) $(((secs%3600)/60)) "$rc"
 
   # A clean exit does not mean clean results: per-clip and per-call failures are
   # caught and printed, and the meta-device warning is not an error at all.
@@ -175,7 +182,7 @@ run_judges(dataset='$DATASET', num_clips=$N, models=['$judge'], shard=($IDX, $CO
   if grep -q "meta device" "$log"; then
     echo "     VOID: 'meta device' in the log -- the adapter did not load and"
     echo "           these scores came from the bare base model. Delete them:"
-    echo "           aws s3 rm --recursive s3://nickb-aarj/results/pass1/$judge/$DATASET/"
+    echo "           aws s3 rm --recursive s3://nickb-aarj/results/pass1/$judge/$ds/"
     status=1
   fi
   # FAILED lines are tolerable -- a variant that was never rendered, a call
@@ -186,6 +193,7 @@ run_judges(dataset='$DATASET', num_clips=$N, models=['$judge'], shard=($IDX, $CO
     echo "     $n_failed FAILED lines -- grep the log"
     total_failed=$(( total_failed + n_failed ))
   fi
+  done
 done
 
 total=$(( $(date +%s) - run_start ))
