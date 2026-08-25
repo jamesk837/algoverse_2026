@@ -181,6 +181,41 @@ def group_scores(records, groups):
     return out, unparsed, calls
 
 
+def _rankdata(xs):
+    """Midranks. The human label is an integer 1-5, so ties are the norm, not
+    the exception -- argsort(argsort(x)) would hand hundreds of tied clips
+    consecutive distinct ranks and invent correlation out of nothing."""
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _pearson(a, b):
+    n = len(a)
+    if n < 3:
+        return None
+    ma, mb = sum(a) / n, sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    if va <= 0 or vb <= 0:
+        return None
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    return cov / (va ** 0.5 * vb ** 0.5)
+
+
+def _spearman(a, b):
+    return _pearson(_rankdata(a), _rankdata(b))
+
+
 def _by_level(clean, human, index, label):
     levels = defaultdict(list)
     for stem, v in clean.items():
@@ -198,6 +233,20 @@ def _by_level(clean, human, index, label):
         rising = all(b >= a for a, b in zip(means, means[1:]))
         print("      span %.3f, monotonic: %s"
               % (max(means) - min(means), "yes" if rising else "no"))
+    # Correlation is what the papers report, so it is what makes our number
+    # comparable. Reference points, both on their OWN distributions:
+    # VideoPhy-2-AutoEval Pearson 0.37 vs human PC (0.47 SA), Table 4 of
+    # arXiv 2503.06800. PhyJudge-9B reports relative bias on PhyGround, not
+    # correlation, and was never evaluated on VideoPhy-2 -- so for that judge
+    # this is an off-distribution number with no published counterpart.
+    pairs = [(v, human[s][index]) for s, v in clean.items() if s in human]
+    if len(pairs) >= 3:
+        xs = [p[0] for p in pairs]
+        ys = [float(p[1]) for p in pairs]
+        rho, r = _spearman(xs, ys), _pearson(xs, ys)
+        fmt = lambda z: "n/a" if z is None else "%+.3f" % z
+        print("      spearman %s   pearson %s   (n=%d)"
+              % (fmt(rho), fmt(r), len(pairs)))
 
 
 def report(judges=None, datasets=None):
