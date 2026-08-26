@@ -76,7 +76,7 @@ _P2_VIOLATION_WORDS = {"yes", "true"}
 # legitimate instruction score of 0 and can pick up a stray 4 or 5 out of the
 # explanation instead.
 _P2_INSTR_RE = re.compile(r"\b([0-3])\b")   # vila instruction
-_P2_INT_RE = re.compile(r"\b([1-5])\b")     # videophy2 SA / PC
+_P2_INT_RE = re.compile(r"\b([1-5])\b")     # unused scale guard, see below
 # JSON first, prose after: upstream's parse_score never had to cope with
 # trailing text, so pass 2 retries it on the first {...} block if it comes
 # back empty.
@@ -151,6 +151,16 @@ VP2_NUM_MAP = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
 }
+
+# Pass 2's videophy2 parser, built FROM VP2_NUM_MAP so its vocabulary can never
+# drift from pass 1's. The only difference is that this one is positional: it
+# takes the earliest token in the reply, where vp2_parse walks the map in dict
+# order and so lets a "one" anywhere in the explanation beat a leading "3".
+# Digits-only would have been a regression -- pass 1 accepts number words, so a
+# reply of "Three. The water flows naturally." must keep parsing as 3.
+_P2_VP2_RE = re.compile(
+    r"\b(" + "|".join(sorted(VP2_NUM_MAP, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE)
 
 WMB_COT = False
 
@@ -596,10 +606,10 @@ class VideoPhy2AutoJudge:
             res = self.model.generate(**inputs, **kwargs)
         output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
         if self.pass2:
-            # positional: vp2_parse scans number WORDS in dict order, not by
-            # position, so "there is one ball" would beat a leading "3"
-            m = _P2_INT_RE.search(output or "")
-            return output, (int(m.group(1)) if m else None)
+            # positional, same vocabulary as pass 1: vp2_parse walks the map in
+            # dict order, so "there is one ball" would beat a leading "3"
+            m = _P2_VP2_RE.search(output or "")
+            return output, (VP2_NUM_MAP[m.group(1).lower()] if m else None)
         return output, vp2_parse(output)
 
 
