@@ -63,7 +63,14 @@ RATIONALE_REQUEST = (
 # by position, so "there is one ball" wins over a leading "3". Pass 2 therefore
 # parses POSITIONALLY -- first answer token, everything after it ignored.
 _P2_SCORE_RE = re.compile(r"score\s*[:=]\s*(-?[0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
-_P2_YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+# The prompt asks for "Yes" or "No", but a model writing an explanation often
+# answers True/False instead, so both vocabularies are accepted. POLARITY: the
+# question is "does it show any violation of X", and upstream stores True for
+# "no violation found" (its parse is `"no" in pred.lower()`). So yes/true mean
+# a violation IS present and store False; no/false store True. Getting this
+# backwards would invert every law column without any visible symptom.
+_P2_YESNO_RE = re.compile(r"\b(yes|no|true|false)\b", re.IGNORECASE)
+_P2_VIOLATION_WORDS = {"yes", "true"}
 # The two scales are NOT the same and must not share a pattern: WorldModelBench's
 # instruction score is 0-3, VideoPhy-2's is 1-5. A shared [1-5] silently drops a
 # legitimate instruction score of 0 and can pick up a stray 4 or 5 out of the
@@ -519,7 +526,10 @@ class VilaEwmJudge:
             m = _P2_INSTR_RE.search(pred or "")
             return float(m.group(1)) if m else None
         m = _P2_YESNO_RE.search(pred or "")
-        return (m.group(1).lower() == "no") if m else None
+        if not m:
+            return None
+        # True == no violation found, matching upstream's stored polarity
+        return m.group(1).lower() not in _P2_VIOLATION_WORDS
 
     def run(self, video_path, caption, call_id):
         prompt = self.build_prompt(call_id, caption)
