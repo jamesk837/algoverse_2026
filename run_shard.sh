@@ -18,6 +18,10 @@
 #   VENVS=$HOME/venvs
 #   LOGS=$HOME/logs
 #   SKIP_SETUP=1     assume the venvs exist instead of building missing ones
+#   PARAPHRASE=1     run the prompt-paraphrase variant instead of pass 1:
+#                    same calls, decoding, parsers and variants, reworded
+#                    prompts, written to results/paraphrase/p<k>/. Logs get a
+#                    _p<k> suffix so they never collide with a pass-1 run.
 #   PYTHON=python3.12  interpreter the venvs are built from; the pins need
 #                    3.10-3.12, so this is required wherever python3 is newer
 #
@@ -35,6 +39,17 @@ COUNT="${2:-8}"
 # meta-device corruption, so they cannot share one.
 DATASETS="${DATASETS:-${DATASET:-test implausibench_real implausibench_implausible}}"
 JUDGES="${JUDGES:-phyjudge_9b vila_ewm videophy2_auto}"
+PARAPHRASE="${PARAPHRASE:-}"
+if [ -n "$PARAPHRASE" ]; then
+  case "$PARAPHRASE" in *[!0-9]*) echo "bad PARAPHRASE: '$PARAPHRASE'" >&2; exit 1 ;; esac
+  PARA_ARG=", paraphrase=$PARAPHRASE"
+  PARA_TAG="_p$PARAPHRASE"
+  PARA_PREFIX="results/paraphrase/p$PARAPHRASE"
+else
+  PARA_ARG=""
+  PARA_TAG=""
+  PARA_PREFIX="results/pass1"
+fi
 VENVS="${VENVS:-$HOME/venvs}"
 LOGS="${LOGS:-$HOME/logs}"
 
@@ -122,6 +137,16 @@ import boto3
 boto3.client('sts', region_name='us-east-1').get_caller_identity()" \
   || die "no AWS credentials -- is the IAM instance profile attached?"
 
+# A run that scores for hours and then 403s on every upload is the worst way to
+# learn the policy is missing a prefix. results/pass2 and results/paraphrase were
+# each granted separately from results/pass1, so check the one this run will use.
+"$FIRST_VENV/bin/python" -c "
+import boto3
+s3 = boto3.client('s3', region_name='us-east-1')
+k = '$PARA_PREFIX/_write_test'
+s3.put_object(Bucket='nickb-aarj', Key=k, Body=b'ok')
+s3.delete_object(Bucket='nickb-aarj', Key=k)"   || die "cannot write s3://nickb-aarj/$PARA_PREFIX/ -- add it to the IAM policy"
+
 # Left to run_judges: it filters to clips that actually have rendered attacks
 # and prints the real count per dataset, which a bare listing count would
 # misreport (videophy2_test lists 1638 objects for ~450 usable clips).
@@ -135,6 +160,11 @@ fi
 mkdir -p "$LOGS"
 echo "======================================================================"
 echo "shard $IDX/$COUNT   clips/dataset=${N:-all}"
+if [ -n "$PARAPHRASE" ]; then
+  echo "PARAPHRASE $PARAPHRASE -> s3://nickb-aarj/$PARA_PREFIX/"
+else
+  echo "pass 1 -> s3://nickb-aarj/$PARA_PREFIX/"
+fi
 echo "datasets: $DATASETS"
 echo "judges:   $JUDGES"
 echo "logs:   $LOGS"
@@ -148,7 +178,7 @@ total_failed=0
 for judge in $JUDGES; do
   venv="$(venv_for "$judge")"
   for ds in $DATASETS; do
-  log="$LOGS/${judge}_${ds}_${IDX}.log"
+  log="$LOGS/${judge}_${ds}_${IDX}${PARA_TAG}.log"
   echo
   echo "---- $judge / $ds  ($(date '+%F %T'))  -> $log"
   t0=$(date +%s)
@@ -156,7 +186,7 @@ for judge in $JUDGES; do
   # -u or a detached log stays empty until the buffer flushes
   "$venv/bin/python" -u -c "
 from judge_harness import run_judges
-run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, $COUNT))
+run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, $COUNT)$PARA_ARG)
 " 2>&1 | tee "$log"
   rc="${PIPESTATUS[0]}"
 
@@ -182,7 +212,7 @@ run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, 
   if grep -q "meta device" "$log"; then
     echo "     VOID: 'meta device' in the log -- the adapter did not load and"
     echo "           these scores came from the bare base model. Delete them:"
-    echo "           aws s3 rm --recursive s3://nickb-aarj/results/pass1/$judge/$ds/"
+    echo "           aws s3 rm --recursive s3://nickb-aarj/$PARA_PREFIX/$judge/$ds/"
     status=1
   fi
   # FAILED lines are tolerable -- a variant that was never rendered, a call
