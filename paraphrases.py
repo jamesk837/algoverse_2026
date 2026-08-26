@@ -68,12 +68,58 @@ Evaluate if this video follows the instruction: '{instruction}'.
             Let's analyze step-by-step and conclude with 'Score: [score]'.
 """,
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            """\
+Assess whether the video adheres to the instruction: '{instruction}'.
+Apply this scoring rubric:
+
+- 0: The video has no connection to the instruction whatsoever.
+- 1: The video shows the right object performing the wrong action, or the wrong action performed on the right object.
+- 2: The video follows the instruction and moves toward the intended goal.
+- 3: The video follows the instruction exactly and fully achieves the goal.
+
+Reason through this step-by-step, then finish with 'Score: [score]'.
+""",
+            """\
+Does this video carry out the instruction '{instruction}'? Judge it against this rubric:
+
+- 0: No relation to the instruction is shown.
+- 1: Either the object or the action is correct, but not both.
+- 2: The instruction is followed and progress toward the goal is visible.
+- 3: The instruction is followed exactly and the goal is fully achieved.
+
+Work through your reasoning step-by-step and end with 'Score: [score]'.
+""",
+            """\
+Instruction to check: '{instruction}'. Decide how well the video follows it using this scale:
+
+- 0: The instruction is not followed in any way.
+- 1: One part is right, either the object or the action, and the other part is wrong.
+- 2: The video is on track and follows the instruction toward the intended result.
+- 3: The instruction is followed exactly and the goal is fully reached.
+
+Think it through step-by-step, and conclude with 'Score: [score]'.
+""",
+            """\
+Rate how faithfully the video executes the instruction: '{instruction}', using the criteria below.
+
+- 0: There is no sign of the instruction being followed.
+- 1: Only the object or only the action matches the instruction, not both.
+- 2: The video follows the instruction and shows real progress toward the goal.
+- 3: The video follows the instruction exactly and completes the goal successfully.
+
+Analyze step-by-step, then give your conclusion as 'Score: [score]'.
+""",
+            """\
+Check the video against the instruction: '{instruction}'. Score it with this rubric:
+
+- 0: The video has nothing to do with the instruction.
+- 1: Either the object is correct and the action is wrong, or the action is correct and the object is wrong.
+- 2: The video follows the instruction and trends toward the intended outcome.
+- 3: The video follows the instruction precisely and reaches the goal.
+
+Step through your reasoning, then conclude with 'Score: [score]'.
+""",
+        ],
     },
     "physical_laws": {
         "original": """\
@@ -81,12 +127,27 @@ Watch the video and determine if it shows any '{physical_laws}'
             Let's think step-by-step and conclude with "Yes" or "No".
 """,
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            """\
+Watch the video closely and decide whether it displays any '{physical_laws}'
+            Reason through it step-by-step and answer with "Yes" or "No".
+""",
+            """\
+Review the video and check whether it contains any '{physical_laws}'
+            Walk through your reasoning step-by-step, then answer "Yes" or "No".
+""",
+            """\
+After watching the video, determine whether it exhibits any '{physical_laws}'
+            Think step-by-step before answering "Yes" or "No".
+""",
+            """\
+Examine the video for any occurrence of '{physical_laws}'
+            Work through the reasoning step-by-step and conclude with "Yes" or "No".
+""",
+            """\
+Does the video show any instance of '{physical_laws}'
+            Consider it step-by-step and respond with "Yes" or "No".
+""",
+        ],
     },
     "common_sense": {
         "original": """\
@@ -94,12 +155,27 @@ Does the video exhibit '{common_sense}'?
             Let's think step-by-step and conclude with "Yes" or "No".
 """,
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            """\
+Does the video display '{common_sense}'?
+            Think it through step-by-step and answer with "Yes" or "No".
+""",
+            """\
+Is '{common_sense}' present anywhere in the video?
+            Reason step-by-step, then answer "Yes" or "No".
+""",
+            """\
+Can you identify '{common_sense}' in the video?
+            Walk through it step-by-step and conclude with "Yes" or "No".
+""",
+            """\
+Does the video contain an instance of '{common_sense}'?
+            Step through your reasoning and give a final "Yes" or "No".
+""",
+            """\
+Would you say the video shows '{common_sense}'?
+            Think step-by-step before answering "Yes" or "No".
+""",
+        ],
     },
 }
 
@@ -115,72 +191,72 @@ VILA_QUESTIONS = {
     "physical_laws_0": {
         "original": "Violation of Newton's Law: Objects move without any external force.",
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Newton's Law violation: an object moves even though no external force acts on it.",
+            "Breach of Newton's Law: something starts moving with no external force behind it.",
+            "Newton's Law is broken: objects change motion without any outside force causing it.",
+            "A Newton's Law violation, where objects gain motion despite no external force being applied.",
+            "Newton's Law violation: motion appears without any external force to explain it.",
+        ],
     },
     "physical_laws_1": {
         "original": 'Violation of the Law of Conservation of Mass or Solid Constitutive Law: Objects deform irregularly.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Violation of Conservation of Mass or the Solid Constitutive Law: solid objects warp or deform in an irregular way.",
+            "Breach of the Law of Conservation of Mass or Solid Constitutive Law: objects distort inconsistently.",
+            "Conservation of Mass or Solid Constitutive Law violation: solids bend or deform in unnatural, irregular ways.",
+            "Violation of the Law of Conservation of Mass or the Solid Constitutive Law, seen as objects deforming irregularly.",
+            "The Law of Conservation of Mass or Solid Constitutive Law is violated: object shapes change irregularly.",
+        ],
     },
     "physical_laws_2": {
         "original": 'Violation of Fluid Constitutive Law: Liquids flow in an unnatural manner.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Fluid Constitutive Law violation: liquid moves in a way that looks unnatural.",
+            "Breach of the Fluid Constitutive Law: fluids behave and flow abnormally.",
+            "Violation of the Fluid Constitutive Law, where liquids flow in a manner that defies natural behavior.",
+            "Fluid Constitutive Law is violated: the way liquid flows looks physically implausible.",
+            "A Fluid Constitutive Law violation: liquid movement appears unnatural or physically wrong.",
+        ],
     },
     "physical_laws_3": {
         "original": 'Violation of Non-physical Penetration: Objects unnaturally pass through each other.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Non-physical Penetration violation: solid objects pass through one another without colliding.",
+            "Breach of Non-physical Penetration: objects overlap or pass through each other unnaturally.",
+            "Violation of Non-physical Penetration, where objects interpenetrate in a way that shouldn't be physically possible.",
+            "Non-physical Penetration is violated: two objects move through each other instead of colliding.",
+            "A Non-physical Penetration violation: objects pass through one another in an unnatural way.",
+        ],
     },
     "physical_laws_4": {
         "original": 'Violation of Gravity: Objects behave inconsistently with gravity.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Gravity violation: objects act in ways that don't match how gravity should affect them.",
+            "Breach of Gravity: object behavior is inconsistent with gravitational pull.",
+            "Violation of Gravity, where objects move or rest in ways gravity wouldn't allow.",
+            "Gravity is violated: objects behave inconsistently with how gravity should act on them.",
+            "A Gravity violation: the way objects move doesn't line up with gravity's effects.",
+        ],
     },
     "common_sense_0": {
         "original": 'Poor Aesthetics: Visually unappealing or low-quality content.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Poor Aesthetics: the visuals are unappealing or come across as low quality.",
+            "Weak Aesthetics: the content looks visually unattractive or low-grade.",
+            "Poor Aesthetics, meaning the footage is visually unappealing or poor in quality.",
+            "Low Aesthetic Quality: the video looks visually unattractive or cheaply made.",
+            "Poor Aesthetics: the visual content is unappealing or of low production quality.",
+        ],
     },
     "common_sense_1": {
         "original": 'Temporal Inconsistency: Noticeable flickering or abrupt changes.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Temporal Inconsistency: visible flickering or sudden, jarring changes over time.",
+            "Temporal Inconsistency, shown as noticeable flicker or abrupt shifts between frames.",
+            "Temporal Inconsistency: the video has obvious flickering or sudden jumps.",
+            "Temporal Inconsistency, meaning there's noticeable flicker or abrupt visual changes.",
+            "Temporal Inconsistency: frames flicker noticeably or change abruptly.",
+        ],
     },
 }
 
@@ -201,22 +277,22 @@ VP2_INSTRUCTIONS = {
     "SA": {
         "original": 'Does this video match the description: "{caption}"? Please rate the video on a scale from 1 to 5, where 5 indicates a perfect match and 1 indicates no relevance.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            'Does this video correspond to the description: "{caption}"? Rate it on a scale from 1 to 5, where 5 means a perfect match and 1 means it has no relevance at all.',
+            'How well does this video reflect the description: "{caption}"? Give it a score from 1 to 5, where 5 is a perfect match and 1 is completely irrelevant.',
+            'Is this video an accurate depiction of the description: "{caption}"? Score it on a scale from 1 to 5, with 5 for a perfect match and 1 for no relevance whatsoever.',
+            'To what extent does this video match the description: "{caption}"? Provide a rating from 1 to 5, where 5 signals a perfect match and 1 signals no relevance.',
+            'Does the video align with the description: "{caption}"? Rate it from 1 to 5, where a 5 means it matches perfectly and a 1 means it is not relevant at all.',
+        ],
     },
     "PC": {
         "original": 'Does this video adhere to the physical laws? Rate the video on a scale from 1 to 5, where 5 means full compliance and 1 means significant violations.',
         "paraphrases": [
-        "",
-        "",
-        "",
-        "",
-        "",
-    ],
+            "Does this video obey the laws of physics? Rate it on a scale from 1 to 5, where 5 means it fully complies and 1 means it violates them significantly.",
+            "Is this video physically plausible? Score it from 1 to 5, where 5 indicates full adherence to physical laws and 1 indicates major violations.",
+            "Does the video respect real-world physics? Give it a rating from 1 to 5, with 5 for complete compliance and 1 for serious violations.",
+            "How well does this video follow the laws of physics? Rate it on a scale from 1 to 5, where 5 means no violations at all and 1 means violations are severe.",
+            "Does this video conform to physical laws? Provide a score from 1 to 5, where 5 reflects full compliance and 1 reflects significant violations.",
+        ],
     },
 }
 
