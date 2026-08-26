@@ -10,9 +10,7 @@ What lives here:
 
 Protocol, from the spec:
 
-  * 60 base clips, sampled randomly inside a pool of clips with PREVALENT
-    MOTION -- a near-static clip cannot show temporal degradation, so it
-    cannot answer the question the temporal attacks ask.
+  * 60 base clips, drawn at random from the corpora the judges run on.
   * VideoPhy-2 clips are sampled PREFERENTIALLY at human PC >= 4 and SA >= 4,
     so there is headroom for a perturbation to push the score down.
   * Selection NEVER looks at a judge score or a probe prediction. That is
@@ -40,8 +38,8 @@ Colab (fetch the file, do not paste it -- long pastes truncate mid-line):
 
 Needs AWS credentials (Colab secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
 or an instance role) with read on datasets/ + attacks/ + manifests/ and write on
-annotation/ + annotations/. No torch, no GPU: a rater needs opencv (preinstalled
-in Colab) only for build_task_set's motion probe.
+annotation/ + annotations/. No torch, no GPU, no opencv -- the only heavy thing
+a rater's machine does is play two videos at a time.
 """
 
 import argparse
@@ -64,7 +62,6 @@ import numpy as np
 BUCKET = "nickb-aarj"
 TMP_DIR = Path("./tmp_annot")
 TASK_KEY_FMT = "annotation/tasks_{version}.json"
-MOTION_KEY = "annotation/motion_cache_v1.json"
 ANNOT_PREFIX = "annotations"
 HUMAN_ID = "video_url"
 MANIFEST_FMT = "manifests/captions_{dataset}.json"
@@ -386,89 +383,6 @@ def held_out_stems():
     return {s for s, c in doc["clips"].items() if c.get("split") in splits}
 
 
-# ------------------------------------------------------------- motion filter
-
-def motion_score(path, max_frames=48, size=64):
-    """mean absolute frame-to-frame difference on a 64x64 grey downsample, in
-    [0,1]. Decodes sequentially -- CAP_PROP_POS_FRAMES seeking is unreliable on
-    these re-encoded files, the same reason embed_vjepa reads straight through."""
-    import cv2
-
-    cap = cv2.VideoCapture(str(path))
-    frames = []
-    while True:
-        ok, f = cap.read()
-        if not ok:
-            break
-        frames.append(cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (size, size)))
-    cap.release()
-    if len(frames) < 2:
-        return 0.0
-    idx = np.linspace(0, len(frames) - 1, min(max_frames, len(frames))).astype(int)
-    sel = [frames[i].astype(np.float32) for i in idx]
-    d = [np.abs(sel[i + 1] - sel[i]).mean() for i in range(len(sel) - 1)]
-    return float(np.mean(d) / 255.0)
-
-
-def load_motion_cache():
-    """S3 copy merged with the local one. Scores are deterministic per clip, so
-    a union is safe and either source can be missing."""
-    cache = get_json(MOTION_KEY, {}) or {}
-    local = TMP_DIR / "motion_cache.json"
-    if local.exists():
-        try:
-            cache.update(json.loads(local.read_text(encoding="utf-8")))
-        except Exception as exc:
-            print("  (local motion cache unreadable: %s)" % exc)
-    return cache
-
-
-def save_motion_cache(cache, push=True):
-    """Written even on a dry run, and after every dataset rather than at the
-    end. Motion scores are a pure derived cache -- not a decision and not an
-    output -- and re-probing them is the single most expensive thing here, so
-    discarding them because the caller said dry_run is exactly backwards: the
-    dry run is the mode you repeat while tuning quotas."""
-    if not cache:
-        return
-    local = TMP_DIR / "motion_cache.json"
-    local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_text(json.dumps(cache), encoding="utf-8")
-    if push:
-        try:
-            put_json(MOTION_KEY, cache)
-        except Exception as exc:
-            print("  (motion cache not pushed: %s -- kept locally at %s)"
-                  % (exc, local))
-
-
-def motion_for(dataset, pairs, cache, workers=8):
-    """pairs is [(stem, source_key)]. Fills `cache` in place, keyed 'ds|stem'."""
-    todo = [(s, k) for s, k in pairs if ("%s|%s" % (dataset, s)) not in cache]
-    if not todo:
-        return cache
-    print("  %s: probing motion on %d clips (%d cached)"
-          % (dataset, len(todo), len(pairs) - len(todo)))
-
-    def one(item):
-        stem, key = item
-        try:
-            p = download(key, local_path(dataset, stem, "clean", key))
-            return stem, motion_score(p)
-        except Exception as exc:
-            print("  FAILED motion %s: %s" % (stem, exc))
-            return stem, None
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for i, (stem, sc) in enumerate(ex.map(one, todo), 1):
-            if sc is not None:
-                cache["%s|%s" % (dataset, stem)] = sc
-            if i % 50 == 0 or i == len(todo):
-                print("    %d/%d  %.0fs" % (i, len(todo), time.time() - t0))
-    return cache
-
-
 # ---------------------------------------------------------------- sampling
 
 def _u01(*parts):
@@ -543,9 +457,9 @@ def _tiers(dataset, pool, labels):
     return tiers
 
 
-def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
-                   motion_probe_limit=300, raters=("r1", "r2"), overlap=1.0,
-                   version="v1", wanted_variants=None, push=True, dry_run=False):
+def build_task_set(n=60, quotas=None, seed=20260825, raters=("r1", "r2"),
+                   overlap=1.0, version="v1", wanted_variants=None,
+                   push=True, dry_run=False):
     """Freeze the 60-clip annotation set into S3. Run this ONCE; every rater
     then reads the same file, so their item lists and blinding line up. The
     randomness is all at build time -- after this, the 60 clips are fixed.
@@ -562,14 +476,6 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
                             attack delta is comparable today. The judges have
                             not scored these.
                         Mix them if you want both, at half the n each.
-    motion_percentile   'prevalent motion' == above this percentile of the
-                        probed pool. 40 keeps the top 60%.
-    motion_probe_limit  THE COST KNOB. Motion is measured by downloading and
-                        decoding a clip, so this many videos per corpus get
-                        pulled and decoded -- 300 x 3 corpora is a few minutes
-                        on a first run. Scores are cached in S3 and locally
-                        (including on a dry run), so reruns are seconds. Drop
-                        it to ~150 if you only need a stable percentile.
     raters / overlap    `overlap` of items go to EVERY rater (that is what
                         inter-rater agreement is computed on); the rest is
                         split between them, so N raters cover ~N x more items.
@@ -586,7 +492,6 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
 
     t_start = time.time()
     with no_model_reads():
-        cache = load_motion_cache()
         chosen, notes = [], {}
 
         for dataset, quota in quotas.items():
@@ -605,46 +510,18 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
                 continue
 
             tiers = _tiers(dataset, pool, labels)
-            rng = random.Random(_seed_int(seed, dataset))
-            probe = []
-            for _, tier in tiers:
-                t = list(tier)
-                rng.shuffle(t)
-                probe.extend(t)
-            probe = probe[:motion_probe_limit]
-            t0 = time.time()
-            motion_for(dataset, [(c["stem"], c["source_key"]) for c in probe], cache)
-            # save per dataset, not at the end: this is the expensive part, and
-            # a crash or a timeout three datasets in should not throw it away
-            save_motion_cache(cache, push=push)
-            t_motion = time.time() - t0
-
-            def m(c):
-                return cache.get("%s|%s" % (dataset, c["stem"]))
-
-            scored = [m(c) for c in probe if m(c) is not None]
-            thr = float(np.percentile(scored, motion_percentile)) if scored else 0.0
-            print("  motion threshold p%d = %.4f  (probed %d in %.0fs)"
-                  % (motion_percentile, thr, len(scored), t_motion))
-
             picked, taken, ladder = [], set(), []
-            for relax_motion in (False, True):
-                for name, tier in tiers:
-                    if len(picked) >= quota:
-                        break
-                    avail = [c for c in tier if c["stem"] not in taken
-                             and m(c) is not None
-                             and (relax_motion or m(c) >= thr)]
-                    rng2 = random.Random(_seed_int(seed, dataset, name, relax_motion))
-                    rng2.shuffle(avail)
-                    take = avail[:quota - len(picked)]
-                    if take:
-                        ladder.append("%s%s: %d" % (name, "" if not relax_motion
-                                                    else " (motion relaxed)", len(take)))
-                        picked.extend(take)
-                        taken.update(c["stem"] for c in take)
+            for name, tier in tiers:
                 if len(picked) >= quota:
                     break
+                avail = [c for c in tier if c["stem"] not in taken]
+                rng = random.Random(_seed_int(seed, dataset, name))
+                rng.shuffle(avail)
+                take = avail[:quota - len(picked)]
+                if take:
+                    ladder.append("%s: %d" % (name, len(take)))
+                    picked.extend(take)
+                    taken.update(c["stem"] for c in take)
             if len(picked) < quota:
                 ladder.append("SHORT by %d" % (quota - len(picked)))
             print("  selected %d/%d  [%s]" % (len(picked), quota, "; ".join(ladder)))
@@ -655,7 +532,7 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
                 chosen.append({
                     "dataset": dataset, "stem": c["stem"], "source_key": c["source_key"],
                     "variants": c["variants"], "missing_variants": c["missing"],
-                    "pc": pc, "sa": sa, "motion": round(m(c), 5),
+                    "pc": pc, "sa": sa,
                 })
 
     doc = {
@@ -664,7 +541,6 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
         "seed": seed,
         "n_clips": len(chosen),
         "quotas": quotas,
-        "motion": {"percentile": motion_percentile, "probe_limit": motion_probe_limit},
         "selection": notes,
         "raters": list(raters),
         "overlap": overlap,
@@ -677,8 +553,7 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
     preview(doc)
     print("  built in %.0fs" % (time.time() - t_start))
     if dry_run:
-        print("\n  --dry-run: no task set written (motion cache kept, so a "
-              "rerun is fast)")
+        print("\n  --dry-run: nothing written")
         return doc
     if push:
         put_json(TASK_KEY_FMT.format(version=version), doc)
@@ -701,9 +576,8 @@ def preview(doc):
     by_ds = Counter(c["dataset"] for c in clips)
     for ds in sorted(by_ds):
         sub = [c for c in clips if c["dataset"] == ds]
-        mot = [c["motion"] for c in sub]
         pcs = [c["pc"] for c in sub if c["pc"] is not None]
-        line = "  %-28s n=%-3d motion %.4f-%.4f" % (ds, len(sub), min(mot), max(mot))
+        line = "  %-28s n=%-3d" % (ds, len(sub))
         if pcs:
             line += "  pc %s" % dict(sorted(Counter(pcs).items()))
             sas = [c["sa"] for c in sub if c["sa"] is not None]
@@ -1162,7 +1036,7 @@ def annotate(rater, version="v1", doc=None, mode="pair+rate", limit=None,
 # ------------------------------------------------------------- calibration
 
 def calibration(dataset="test", seed=20260825, quiz=False, width=320,
-                prefer_motion=True, per_level=1):
+                per_level=1):
     """One CLEAN VideoPhy-2 clip at each human PC level 1..5, side by side with
     the rubric. Watch these before rating anything -- the written scale is a
     paraphrase, these clips are the actual anchor.
@@ -1181,7 +1055,6 @@ def calibration(dataset="test", seed=20260825, quiz=False, width=320,
             raise RuntimeError("no human labels -- cannot calibrate")
         srcs = {stem_of(k): k for k in list_keys(DATASET_PREFIXES[dataset], VIDEO_SUFFIXES)
                 if "/_metadata/" not in k}
-        cache = get_json(MOTION_KEY, {}) or {}
         rendered = list_dirs("attacks/%s/" % dataset)
 
         pick = {}
@@ -1193,11 +1066,6 @@ def calibration(dataset="test", seed=20260825, quiz=False, width=320,
             if not pool:
                 print("  no clip at PC=%d" % level)
                 continue
-            if prefer_motion:
-                scored = [(cache.get("%s|%s" % (dataset, s), -1.0), s) for s in pool]
-                have = [s for m, s in scored if m >= 0]
-                if len(have) >= per_level:
-                    pool = [s for _, s in sorted(scored, reverse=True)[:max(8, per_level)]]
             rng = random.Random(_seed_int(seed, "calib", level))
             pool = sorted(pool)
             rng.shuffle(pool)
@@ -1667,7 +1535,7 @@ def selftest():
 
     doc = {"version": "t", "seed": 7, "raters": ["a", "b"], "overlap": 0.25,
            "clips": [{"dataset": "test", "stem": "s%d" % i, "source_key": "k%d" % i,
-                      "variants": VARIANTS, "pc": 4, "sa": 4, "motion": 0.1,
+                      "variants": VARIANTS, "pc": 4, "sa": 4,
                       "missing_variants": []} for i in range(20)]}
     ia, ib = items_for(doc, "a", quiet=True), items_for(doc, "b", quiet=True)
     ok(items_for(doc, "a", quiet=True) == ia, "assignment is deterministic")
@@ -1702,8 +1570,6 @@ def main():
                          'probe-comparable set (default: 36 test + 12 + 12)')
     ap.add_argument("--raters", nargs="*", default=["r1", "r2"])
     ap.add_argument("--overlap", type=float, default=1.0)
-    ap.add_argument("--motion-percentile", type=float, default=40)
-    ap.add_argument("--motion-probe-limit", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--report", action="store_true")
@@ -1720,8 +1586,6 @@ def main():
         quotas = json.loads(args.quotas) if args.quotas else None
         build_task_set(n=args.n, quotas=quotas, seed=args.seed, version=args.version,
                        raters=tuple(args.raters), overlap=args.overlap,
-                       motion_percentile=args.motion_percentile,
-                       motion_probe_limit=args.motion_probe_limit,
                        dry_run=args.dry_run)
         return
     if args.preview:
