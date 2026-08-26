@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -100,6 +101,59 @@ VP2_GENERATE_KWARGS = {
     "temperature": 0.001,
     "max_length": 256,
 }
+
+# The ONLY prompts in this file that are not upstream's. VideoPhy-2 ships no
+# CoT form -- these are written here, following the wording of arXiv 2503.03064
+# ("Begin your evaluation by providing a short explanation. Be as objective as
+# possible. After providing your explanation, please rate ...") and adapted to
+# VideoPhy-2's 1-5 scale and its two questions. The rating sentence itself is
+# left as upstream wrote it; the explanation instruction is inserted before it
+# and an explicit "Score: <number>" anchor is appended after it.
+#
+# That anchor is not decoration. vp2_parse substring-matches number WORDS, so
+# on prose it reads "the video shows one ball" as a score of 1 -- a wrong
+# number that looks like a real one. CoT runs therefore use vp2_parse_cot,
+# which accepts nothing but the explicit anchor.
+#
+# Unlike vila and phyjudge, this condition has no upstream to be faithful to,
+# so SMOKE-TEST IT: run one clip with push_to_s3=False and read the raw text
+# before spending GPU hours.
+_VP2_COT_INSTRUCTION = (
+    "Begin your evaluation by providing a short explanation. "
+    "Be as objective as possible. After providing your explanation, "
+)
+_VP2_COT_ANCHOR = " End your reply with \"Score: <number>\"."
+
+PROMPT_SA_COT = (
+    "The following is a conversation between a curious human and an AI assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+    "Human: <|video|>\n"
+    "Human: Does this video match the description: \"{caption}\"? "
+    + _VP2_COT_INSTRUCTION +
+    "rate the video on a scale from 1 to 5, where 5 indicates a perfect match "
+    "and 1 indicates no relevance."
+    + _VP2_COT_ANCHOR + "\n"
+    "AI: "
+)
+
+PROMPT_PHYSICS_COT = (
+    "The following is a conversation between a curious human and an AI assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+    "Human: <|video|>\n"
+    "Human: Does this video adhere to the physical laws? "
+    + _VP2_COT_INSTRUCTION +
+    "rate the video on a scale from 1 to 5, where 5 means full compliance "
+    "and 1 means significant violations."
+    + _VP2_COT_ANCHOR + "\n"
+    "AI: "
+)
+
+# max_length counts prompt + completion, so an explanation needs headroom.
+VP2_GENERATE_KWARGS_COT = dict(VP2_GENERATE_KWARGS, max_length=512)
+
+# Only an explicit "Score: N" with N in 1..5. Last match wins, so a model that
+# restates the scale mid-explanation and commits at the end is read correctly.
+VP2_SCORE_RE = re.compile(r"score\s*[:=]\s*([1-5])(?![0-9])", re.IGNORECASE)
 VP2_NUM_FRAMES = 32
 
 VP2_NUM_MAP = {
@@ -358,6 +412,20 @@ def vp2_parse(output):
     return None
 
 
+def vp2_parse_cot(output):
+    """Strict counterpart to vp2_parse, for CoT output.
+
+    Returns None rather than guessing. That is the point: vp2_parse's loose
+    substring match is exactly what makes prose unparseable-but-plausible, so
+    the fix cannot be a slightly-less-loose version of it. An unparsed call is
+    recorded in record["unparsed"] and is visible; a wrong score is not.
+    """
+    if not output:
+        return None
+    found = VP2_SCORE_RE.findall(output)
+    return int(found[-1]) if found else None
+
+
 def _patch_vila_video_cache():
     """Decode each clip once per variant instead of once per call.
 
@@ -475,17 +543,16 @@ class VilaEwmJudge:
 class VideoPhy2AutoJudge:
     name = "videophy2_auto"
     s3_prefix = "models/videophy_2_auto/"
-    # No CoT form exists for this one. It is entailment-style
-    # mPLUG-Owl-Video completing "AI: " after a fixed conversation string,
-    # not a chat model that can be asked to explain itself, and it was SFT'd
-    # on that exact template. Bolting an "explain first" instruction on
-    # would measure off-distribution drift rather than the CoT effect --
-    # the same reason the prompt-paraphrase attack is out of scope. Its
-    # max_length of 256 would also truncate any explanation.
-    supports_cot = False
+    # The one judge whose CoT condition is OURS, not upstream's -- VideoPhy-2
+    # ships no CoT form. It is entailment-style mPLUG-Owl-Video completing
+    # "AI: " after a fixed conversation string, SFT'd on that exact template,
+    # so its CoT numbers are off-distribution in a way vila's and phyjudge's
+    # are not. Report them as a separate condition, never pooled with those.
+    supports_cot = True
 
-    def __init__(self, num_frames=VP2_NUM_FRAMES):
+    def __init__(self, num_frames=VP2_NUM_FRAMES, cot=False):
         self.num_frames = num_frames
+        self.cot = cot
         self.torch = None
         self.model = None
 
@@ -516,6 +583,9 @@ class VideoPhy2AutoJudge:
         self.model = self.model.to("cuda").to(torch.bfloat16)
 
     def build_prompt(self, call_id, caption):
+        if self.cot:
+            return (PROMPT_SA_COT.format(caption=caption) if call_id == "SA"
+                    else PROMPT_PHYSICS_COT)
         if call_id == "SA":
             return PROMPT_SA.format(caption=caption)
         return PROMPT_PHYSICS
@@ -528,10 +598,12 @@ class VideoPhy2AutoJudge:
         inputs = {k: v.bfloat16() if v.dtype == torch.float else v
                   for k, v in inputs.items()}
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        gen_kwargs = VP2_GENERATE_KWARGS_COT if self.cot else VP2_GENERATE_KWARGS
         with torch.no_grad():
-            res = self.model.generate(**inputs, **VP2_GENERATE_KWARGS)
+            res = self.model.generate(**inputs, **gen_kwargs)
         output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
-        return output, vp2_parse(output)
+        # strict parser under CoT: vp2_parse would read "one ball" as a 1
+        return output, (vp2_parse_cot(output) if self.cot else vp2_parse(output))
 
 
 class ScalarFpsProcessor:
@@ -764,13 +836,19 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     """cot=True runs the judges' OWN chain-of-thought forms and writes to
     COT_RESULT_PREFIX, never mixing with the greedy records in results/pass1.
 
-    Nothing is reworded to get there. vila_ewm simply stops rewriting
-    upstream's "Let's think step-by-step and conclude with ..." into "Answer
-    with" -- WorldModelBench ships both, and `--cot` being store_true is the
-    only reason off is the default. phyjudge_9b turns on Qwen3's own thinking
-    mode and raises the token budget so the JSON is not truncated behind the
-    reasoning. videophy2_auto has no CoT form and is skipped rather than
-    invented for; see its supports_cot note.
+    Two of the three use their own CoT form, unmodified. vila_ewm simply stops
+    rewriting upstream's "Let's think step-by-step and conclude with ..." into
+    "Answer with" -- WorldModelBench ships both, and `--cot` being store_true
+    is the only reason off is the default. phyjudge_9b turns on Qwen3's own
+    thinking mode and raises the token budget so the JSON is not truncated
+    behind the reasoning.
+
+    videophy2_auto is the exception and must be read as one: VideoPhy-2 ships
+    no CoT form, so PROMPT_*_COT are OURS. Its CoT numbers are off-distribution
+    in a way the other two are not -- report them as a separate condition,
+    never pooled with vila's or phyjudge's. It also swaps in vp2_parse_cot,
+    because the greedy parser substring-matches number words and would read
+    "the video shows one ball" as a score of 1.
 
     Motivation is arXiv 2503.03064: CoT sharpens the judgment distribution
     (they measure a strictly lower standard deviation) and shifts the mean, so
