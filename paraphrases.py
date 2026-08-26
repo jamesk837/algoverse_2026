@@ -79,7 +79,7 @@ Assess whether the video adheres to the instruction: '{instruction}'.
             - 2: The video follows the instruction and moves toward the intended goal.
             - 3: The video follows the instruction exactly and fully achieves the goal.
 
-            Reason through this step-by-step, then finish with 'Score: [score]'.
+            Answer with 'Score: [score]'.
 """,
             """\
 Does this video carry out the instruction '{instruction}'? Judge it against this rubric:
@@ -89,7 +89,7 @@ Does this video carry out the instruction '{instruction}'? Judge it against this
             - 2: The instruction is followed and progress toward the goal is visible.
             - 3: The instruction is followed exactly and the goal is fully achieved.
 
-            Work through your reasoning step-by-step and end with 'Score: [score]'.
+            Answer with 'Score: [score]'.
 """,
             """\
 Instruction to check: '{instruction}'. Decide how well the video follows it using this scale:
@@ -99,7 +99,7 @@ Instruction to check: '{instruction}'. Decide how well the video follows it usin
             - 2: The video is on track and follows the instruction toward the intended result.
             - 3: The instruction is followed exactly and the goal is fully reached.
 
-            Think it through step-by-step, and conclude with 'Score: [score]'.
+            Answer with 'Score: [score]'.
 """,
             """\
 Rate how faithfully the video executes the instruction: '{instruction}', using the criteria below.
@@ -109,7 +109,7 @@ Rate how faithfully the video executes the instruction: '{instruction}', using t
             - 2: The video follows the instruction and shows real progress toward the goal.
             - 3: The video follows the instruction exactly and completes the goal successfully.
 
-            Analyze step-by-step, then give your conclusion as 'Score: [score]'.
+            Answer with 'Score: [score]'.
 """,
             """\
 Check the video against the instruction: '{instruction}'. Score it with this rubric:
@@ -119,7 +119,7 @@ Check the video against the instruction: '{instruction}'. Score it with this rub
             - 2: The video follows the instruction and trends toward the intended outcome.
             - 3: The video follows the instruction precisely and reaches the goal.
 
-            Step through your reasoning, then conclude with 'Score: [score]'.
+            Answer with 'Score: [score]'.
 """,
         ],
     },
@@ -131,23 +131,23 @@ Watch the video and determine if it shows any '{physical_laws}'
         "paraphrases": [
             """\
 Watch the video closely and decide whether it displays any '{physical_laws}'
-            Reason through it step-by-step and answer with "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Review the video and check whether it contains any '{physical_laws}'
-            Walk through your reasoning step-by-step, then answer "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 After watching the video, determine whether it exhibits any '{physical_laws}'
-            Think step-by-step before answering "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Examine the video for any occurrence of '{physical_laws}'
-            Work through the reasoning step-by-step and conclude with "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Does the video show any instance of '{physical_laws}'
-            Consider it step-by-step and respond with "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
         ],
     },
@@ -159,23 +159,23 @@ Does the video exhibit '{common_sense}'?
         "paraphrases": [
             """\
 Does the video display '{common_sense}'?
-            Think it through step-by-step and answer with "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Is '{common_sense}' present anywhere in the video?
-            Reason step-by-step, then answer "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Can you identify '{common_sense}' in the video?
-            Walk through it step-by-step and conclude with "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Does the video contain an instance of '{common_sense}'?
-            Step through your reasoning and give a final "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
             """\
 Would you say the video shows '{common_sense}'?
-            Think step-by-step before answering "Yes" or "No".
+            Answer with "Yes" or "No".
 """,
         ],
     },
