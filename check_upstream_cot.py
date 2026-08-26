@@ -85,6 +85,28 @@ COT_STEMS = {
 INDENT = " " * 12
 
 
+def upstream_rewrite(prompt):
+    """Verbatim copy of the prompt half of upstream's evaluate_video body:
+
+        if not cot:
+            prompt = prompt.replace(
+                "Let's think step-by-step and conclude with", "Answer with"
+            ).replace(
+                "Let's analyze step-by-step and conclude with", "Answer with"
+            )
+        return self.judge.generate_content([video, prompt])
+
+    Copied rather than imported so verify() compares our cot=False prompt with
+    THEIR transformation of THEIR template, end to end, instead of with our own
+    reimplementation of it.
+    """
+    return prompt.replace(
+        "Let's think step-by-step and conclude with", "Answer with"
+    ).replace(
+        "Let's analyze step-by-step and conclude with", "Answer with"
+    )
+
+
 def template_key(call_id):
     return "instruction" if call_id == "instruction" else call_id.rsplit("_", 1)[0]
 
@@ -119,6 +141,12 @@ def verify(caption="a ball rolls off a table and falls to the floor"):
             problems.append("%s: cot stem %r missing" % (call_id, COT_STEMS[key]))
         if COT_STEMS[key] in off.build_prompt(call_id, caption):
             problems.append("%s: cot stem survived cot=False" % call_id)
+
+        # our cot=False prompt must equal upstream's own rewrite of upstream's
+        # own template -- this is the end-to-end check, not a self-comparison
+        if off.build_prompt(call_id, caption) != upstream_rewrite(want):
+            problems.append("%s: cot=False prompt differs from upstream's "
+                            "evaluate_video rewrite of their template" % call_id)
 
         a = got.splitlines()
         b = off.build_prompt(call_id, caption).splitlines()
@@ -185,6 +213,13 @@ def run(dataset="test", clip=0):
 
     judge = J.VilaEwmJudge(cot=True)
     judge.load()
+    # upstream does `llava.load(judge_path)` and never touches generation_config;
+    # if we ever set one, decoding would differ from theirs with no visible sign
+    gc = getattr(judge.judge, "generation_config", None)
+    print("judge.generation_config = %r  (upstream sets none)" % gc)
+    if gc is not None:
+        raise RuntimeError("a generation_config is set; upstream sets none, so "
+                           "decoding would no longer match theirs")
     video = judge.llava.Video(str(local))
     print("\nclip: %s\ncaption: %s\n" % (Path(key).stem, caption[:90]))
 
