@@ -17,11 +17,21 @@ except ImportError:
     userdata = None
 
 if userdata is not None:
-    os.environ['AWS_ACCESS_KEY_ID'] = userdata.get('AWS_ACCESS_KEY_ID')
-    os.environ['AWS_SECRET_ACCESS_KEY'] = userdata.get('AWS_SECRET_ACCESS_KEY')
-    try:
-        os.environ['HF_TOKEN'] = userdata.get('HF_TOKEN')
-    except Exception:
+    # The import succeeding does NOT mean userdata is usable: it needs a live
+    # IPython kernel, so `!python foo.py` in Colab -- a subprocess with no
+    # kernel -- raises AttributeError deep inside google.colab._message. That
+    # is a normal way to run things in Colab, and an unguarded call here made
+    # importing this module fail outright. Every secret is therefore optional:
+    # on a miss we fall through to boto3's ambient chain, which is what the
+    # non-Colab path uses anyway.
+    for _var in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'HF_TOKEN'):
+        try:
+            _val = userdata.get(_var)
+        except Exception:
+            continue
+        if _val:
+            os.environ[_var] = _val
+    if not os.environ.get('HF_TOKEN'):
         print("no HF_TOKEN secret; phyjudge_9b base model must be public or cached")
 os.environ.setdefault('AWS_DEFAULT_REGION', 'us-east-1')
 
