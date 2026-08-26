@@ -29,6 +29,15 @@ s3 = boto3.client('s3')
 MODEL_CACHE = Path("./models_cache")
 TMP_DIR = Path("./tmp_judge")
 RESULT_PREFIX = "results/pass1"
+
+# CoT runs write to their OWN prefix. This is the load-bearing part of the
+# whole option: checkpointing is per (clip, variant, call), so if a CoT run
+# shared results/pass1 it would merge CoT answers into the non-CoT records
+# call by call, silently destroying both the existing data and the comparison
+# the flag exists to make. Same layout underneath, so check_results / stats /
+# monitor read it by pointing their own RESULT_PREFIX here.
+COT_RESULT_PREFIX = "results/pass1_cot"
+COT = False  # set by run_judges(cot=...); read by result_key()
 MANIFEST_PREFIX = "manifests"
 
 DATASET_PREFIXES = {
@@ -154,6 +163,11 @@ PHYJUDGE_LAWS = [
 PHYJUDGE_FPS = 2.0
 PHYJUDGE_MAX_PIXELS = 360 * 640
 PHYJUDGE_MAX_NEW_TOKENS = 128
+# With Qwen3 thinking on, the reasoning trace comes BEFORE the JSON, so the
+# non-CoT budget truncates every call mid-thought and each one parses as None.
+# Greedy decoding makes a large budget free -- identical tokens either way, it
+# only removes the ceiling.
+PHYJUDGE_MAX_NEW_TOKENS_COT = 1024
 PHYJUDGE_PROMPT_YAML = "subq+human.yaml"
 
 def key_exists(key):
@@ -402,6 +416,8 @@ def _patch_vila_video_cache():
 class VilaEwmJudge:
     name = "vila_ewm"
     s3_prefix = "models/vila-ewm-qwen2-1.5b/"
+    # upstream ships both forms; `--cot` is store_true, so its default is off
+    supports_cot = True
 
     def __init__(self, cot=WMB_COT):
         self.cot = cot
@@ -459,6 +475,14 @@ class VilaEwmJudge:
 class VideoPhy2AutoJudge:
     name = "videophy2_auto"
     s3_prefix = "models/videophy_2_auto/"
+    # No CoT form exists for this one. It is entailment-style
+    # mPLUG-Owl-Video completing "AI: " after a fixed conversation string,
+    # not a chat model that can be asked to explain itself, and it was SFT'd
+    # on that exact template. Bolting an "explain first" instruction on
+    # would measure off-distribution drift rather than the CoT effect --
+    # the same reason the prompt-paraphrase attack is out of scope. Its
+    # max_length of 256 would also truncate any explanation.
+    supports_cot = False
 
     def __init__(self, num_frames=VP2_NUM_FRAMES):
         self.num_frames = num_frames
@@ -527,12 +551,19 @@ class ScalarFpsProcessor:
 class PhyJudge9BJudge:
     name = "phyjudge_9b"
     s3_prefix = "models/phyjudge-9B/"
+    # Qwen3's native thinking mode, enabled on the chat template. The
+    # prompts stay exactly what the repo's infer.py renders.
+    supports_cot = True
 
     def __init__(self, fps=PHYJUDGE_FPS, max_pixels=PHYJUDGE_MAX_PIXELS,
-                 max_new_tokens=PHYJUDGE_MAX_NEW_TOKENS):
+                 max_new_tokens=None, cot=False):
         self.fps = fps
         self.max_pixels = max_pixels
-        self.max_new_tokens = max_new_tokens
+        self.cot = cot
+        # CoT here is Qwen3's OWN thinking mode, not a prompt we wrote. The
+        # prompts still come from the repo's infer.py, untouched.
+        self.max_new_tokens = max_new_tokens or (
+            PHYJUDGE_MAX_NEW_TOKENS_COT if cot else PHYJUDGE_MAX_NEW_TOKENS)
         self.infer = None
 
     def call_ids(self):
@@ -587,7 +618,8 @@ class PhyJudge9BJudge:
             video_kwargs["video_metadata"] = list(metadata)
 
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=self.cot)
         inputs = self.processor(text=[text], images=image_inputs, videos=video_inputs,
                                 padding=True, return_tensors="pt", **video_kwargs)
         return inputs.to(self.device)
@@ -620,7 +652,8 @@ def video_key_for(dataset, source_key, variant):
 
 
 def result_key(model, dataset, source_key):
-    return f"{RESULT_PREFIX}/{model}/{dataset}/{Path(source_key).stem}.json"
+    prefix = COT_RESULT_PREFIX if COT else RESULT_PREFIX
+    return f"{prefix}/{model}/{dataset}/{Path(source_key).stem}.json"
 
 
 def missing_items(record, call_ids):
@@ -727,11 +760,41 @@ def show_results(df):
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                rebuild_captions=False, show=None, shard=None,
-               require_attacks=True):
+               require_attacks=True, cot=False):
+    """cot=True runs the judges' OWN chain-of-thought forms and writes to
+    COT_RESULT_PREFIX, never mixing with the greedy records in results/pass1.
+
+    Nothing is reworded to get there. vila_ewm simply stops rewriting
+    upstream's "Let's think step-by-step and conclude with ..." into "Answer
+    with" -- WorldModelBench ships both, and `--cot` being store_true is the
+    only reason off is the default. phyjudge_9b turns on Qwen3's own thinking
+    mode and raises the token budget so the JSON is not truncated behind the
+    reasoning. videophy2_auto has no CoT form and is skipped rather than
+    invented for; see its supports_cot note.
+
+    Motivation is arXiv 2503.03064: CoT sharpens the judgment distribution
+    (they measure a strictly lower standard deviation) and shifts the mean, so
+    a judge's gameability under CoT is a different measurement, not a better
+    one. That is why this is a parallel prefix and not a replacement.
+    """
+    global COT
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
     show = (not push_to_s3) if show is None else show
+
+    COT = bool(cot)
+    if COT:
+        blocked = [m for m in models if not getattr(JUDGES[m], "supports_cot", False)]
+        if blocked:
+            print(f"cot=True: skipping {blocked} -- no upstream CoT form; "
+                  f"see supports_cot in judge_harness.py")
+            models = [m for m in models if m not in blocked]
+        if not models:
+            print("cot=True: nothing left to run")
+            return results_frame([])
+        print(f"CoT ON -- writing to s3://{BUCKET}/{COT_RESULT_PREFIX}/ "
+              f"(results/pass1 is untouched)")
 
     captions = build_caption_manifest(dataset, rebuild=rebuild_captions)
     source_keys = list_source_videos(dataset)
@@ -761,7 +824,7 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     records = []
     for model in models:
-        judge = JUDGES[model]()
+        judge = JUDGES[model](cot=True) if COT else JUDGES[model]()
         call_ids = judge.call_ids()
         shard_note = f", shard={shard[0]}/{shard[1]}" if shard else ""
         print(f"\n########## {judge.name} (dataset={dataset}, clips={num_clips}, "
