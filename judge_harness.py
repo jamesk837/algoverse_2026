@@ -64,7 +64,16 @@ RATIONALE_REQUEST = (
 # parses POSITIONALLY -- first answer token, everything after it ignored.
 _P2_SCORE_RE = re.compile(r"score\s*[:=]\s*(-?[0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 _P2_YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
-_P2_INT_RE = re.compile(r"\b([1-5])\b")
+# The two scales are NOT the same and must not share a pattern: WorldModelBench's
+# instruction score is 0-3, VideoPhy-2's is 1-5. A shared [1-5] silently drops a
+# legitimate instruction score of 0 and can pick up a stray 4 or 5 out of the
+# explanation instead.
+_P2_INSTR_RE = re.compile(r"\b([0-3])\b")   # vila instruction
+_P2_INT_RE = re.compile(r"\b([1-5])\b")     # videophy2 SA / PC
+# JSON first, prose after: upstream's parse_score never had to cope with
+# trailing text, so pass 2 retries it on the first {...} block if it comes
+# back empty.
+_P2_JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
 MANIFEST_PREFIX = "manifests"
 
 DATASET_PREFIXES = {
@@ -506,7 +515,8 @@ class VilaEwmJudge:
             m = _P2_SCORE_RE.search(pred or "")
             if m:
                 return float(m.group(1))
-            m = _P2_INT_RE.search(pred or "")
+            # fallback is 0-3, this judge's actual scale -- see _P2_INSTR_RE
+            m = _P2_INSTR_RE.search(pred or "")
             return float(m.group(1)) if m else None
         m = _P2_YESNO_RE.search(pred or "")
         return (m.group(1).lower() == "no") if m else None
@@ -681,7 +691,17 @@ class PhyJudge9BJudge:
             generated_ids = self.model.generate(
                 **inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         raw = infer.decode_generated(self.processor, inputs, generated_ids)
-        return raw, infer.parse_score(raw, score_key)
+        score = infer.parse_score(raw, score_key)
+        if self.pass2 and score is None:
+            # upstream's parser never had to cope with prose after the JSON;
+            # retry it on the first {...} block before giving up
+            m = _P2_JSON_RE.search(raw or "")
+            if m:
+                try:
+                    score = infer.parse_score(m.group(0), score_key)
+                except Exception:
+                    score = None
+        return raw, score
 
 
 JUDGES = {
