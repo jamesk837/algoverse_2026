@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import time
 from pathlib import Path
 
@@ -31,14 +30,24 @@ MODEL_CACHE = Path("./models_cache")
 TMP_DIR = Path("./tmp_judge")
 RESULT_PREFIX = "results/pass1"
 
-# CoT runs write to their OWN prefix. This is the load-bearing part of the
-# whole option: checkpointing is per (clip, variant, call), so if a CoT run
-# shared results/pass1 it would merge CoT answers into the non-CoT records
-# call by call, silently destroying both the existing data and the comparison
-# the flag exists to make. Same layout underneath, so check_results / stats /
-# monitor read it by pointing their own RESULT_PREFIX here.
-COT_RESULT_PREFIX = "results/pass1_cot"
-COT = False  # set by run_judges(cot=...); read by result_key()
+# Pass 2 writes to its own prefix. Checkpointing is per (clip, variant, call),
+# so sharing results/pass1 would merge pass-2 output into the pass-1 records
+# call by call and destroy both. Same layout underneath, so check_results /
+# stats / monitor read it by pointing their own RESULT_PREFIX here.
+PASS2_RESULT_PREFIX = "results/pass2"
+PASS2 = False  # set by run_judges(pass2=...); read by result_key()
+
+# Pass 2 asks for a SCORE RATIONALE, and deliberately not for chain-of-thought.
+# The reasoning configuration is identical to pass 1 and identical across all
+# three judges -- no thinking mode, no "let's think step-by-step", no "explain
+# before you rate". The score is produced exactly as in pass 1 and is then
+# justified afterwards, so the two passes stay comparable; anything that
+# reasons BEFORE answering changes the score itself and there is no longer a
+# controlled comparison to make. One shared wording for the same reason: three
+# judges asked three different questions cannot be compared to each other.
+RATIONALE_REQUEST = (
+    "Explain why and how you arrived at that answer for this video."
+)
 MANIFEST_PREFIX = "manifests"
 
 DATASET_PREFIXES = {
@@ -101,59 +110,8 @@ VP2_GENERATE_KWARGS = {
     "temperature": 0.001,
     "max_length": 256,
 }
-
-# The ONLY prompts in this file that are not upstream's. VideoPhy-2 ships no
-# CoT form -- these are written here, following the wording of arXiv 2503.03064
-# ("Begin your evaluation by providing a short explanation. Be as objective as
-# possible. After providing your explanation, please rate ...") and adapted to
-# VideoPhy-2's 1-5 scale and its two questions. The rating sentence itself is
-# left as upstream wrote it; the explanation instruction is inserted before it
-# and an explicit "Score: <number>" anchor is appended after it.
-#
-# That anchor is not decoration. vp2_parse substring-matches number WORDS, so
-# on prose it reads "the video shows one ball" as a score of 1 -- a wrong
-# number that looks like a real one. CoT runs therefore use vp2_parse_cot,
-# which accepts nothing but the explicit anchor.
-#
-# Unlike vila and phyjudge, this condition has no upstream to be faithful to,
-# so SMOKE-TEST IT: run one clip with push_to_s3=False and read the raw text
-# before spending GPU hours.
-_VP2_COT_INSTRUCTION = (
-    "Begin your evaluation by providing a short explanation. "
-    "Be as objective as possible. After providing your explanation, "
-)
-_VP2_COT_ANCHOR = " End your reply with \"Score: <number>\"."
-
-PROMPT_SA_COT = (
-    "The following is a conversation between a curious human and an AI assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
-    "Human: <|video|>\n"
-    "Human: Does this video match the description: \"{caption}\"? "
-    + _VP2_COT_INSTRUCTION +
-    "rate the video on a scale from 1 to 5, where 5 indicates a perfect match "
-    "and 1 indicates no relevance."
-    + _VP2_COT_ANCHOR + "\n"
-    "AI: "
-)
-
-PROMPT_PHYSICS_COT = (
-    "The following is a conversation between a curious human and an AI assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
-    "Human: <|video|>\n"
-    "Human: Does this video adhere to the physical laws? "
-    + _VP2_COT_INSTRUCTION +
-    "rate the video on a scale from 1 to 5, where 5 means full compliance "
-    "and 1 means significant violations."
-    + _VP2_COT_ANCHOR + "\n"
-    "AI: "
-)
-
-# max_length counts prompt + completion, so an explanation needs headroom.
-VP2_GENERATE_KWARGS_COT = dict(VP2_GENERATE_KWARGS, max_length=512)
-
-# Only an explicit "Score: N" with N in 1..5. Last match wins, so a model that
-# restates the scale mid-explanation and commits at the end is read correctly.
-VP2_SCORE_RE = re.compile(r"score\s*[:=]\s*([1-5])(?![0-9])", re.IGNORECASE)
+# rationale replies are prose, and max_length counts prompt + completion
+VP2_RATIONALE_MAX_LENGTH = 512
 VP2_NUM_FRAMES = 32
 
 VP2_NUM_MAP = {
@@ -217,11 +175,10 @@ PHYJUDGE_LAWS = [
 PHYJUDGE_FPS = 2.0
 PHYJUDGE_MAX_PIXELS = 360 * 640
 PHYJUDGE_MAX_NEW_TOKENS = 128
-# With Qwen3 thinking on, the reasoning trace comes BEFORE the JSON, so the
-# non-CoT budget truncates every call mid-thought and each one parses as None.
-# Greedy decoding makes a large budget free -- identical tokens either way, it
-# only removes the ceiling.
-PHYJUDGE_MAX_NEW_TOKENS_COT = 1024
+# A rationale is prose, not a JSON score, so it needs room. Greedy decoding
+# makes the larger budget free: identical tokens either way, it only lifts the
+# ceiling. Pass 1's budget is untouched.
+PHYJUDGE_RATIONALE_MAX_NEW_TOKENS = 512
 PHYJUDGE_PROMPT_YAML = "subq+human.yaml"
 
 def key_exists(key):
@@ -412,20 +369,6 @@ def vp2_parse(output):
     return None
 
 
-def vp2_parse_cot(output):
-    """Strict counterpart to vp2_parse, for CoT output.
-
-    Returns None rather than guessing. That is the point: vp2_parse's loose
-    substring match is exactly what makes prose unparseable-but-plausible, so
-    the fix cannot be a slightly-less-loose version of it. An unparsed call is
-    recorded in record["unparsed"] and is visible; a wrong score is not.
-    """
-    if not output:
-        return None
-    found = VP2_SCORE_RE.findall(output)
-    return int(found[-1]) if found else None
-
-
 def _patch_vila_video_cache():
     """Decode each clip once per variant instead of once per call.
 
@@ -484,8 +427,6 @@ def _patch_vila_video_cache():
 class VilaEwmJudge:
     name = "vila_ewm"
     s3_prefix = "models/vila-ewm-qwen2-1.5b/"
-    # upstream ships both forms; `--cot` is store_true, so its default is off
-    supports_cot = True
 
     def __init__(self, cot=WMB_COT):
         self.cot = cot
@@ -539,20 +480,23 @@ class VilaEwmJudge:
         pred = str(self.judge.generate_content([video, prompt]))
         return pred, self.parse(call_id, pred)
 
+    def rationale(self, video_path, caption, call_id, answer):
+        """Pass 2: the pass-1 question, the answer it gave, then the request.
+
+        The scoring prompt is reused verbatim and the score is not regenerated
+        -- it is quoted back from pass 1 -- so nothing about how that score was
+        produced changes."""
+        prompt = "%s\n%s\n%s" % (self.build_prompt(call_id, caption),
+                                  str(answer).strip(), RATIONALE_REQUEST)
+        video = self.llava.Video(str(video_path))
+        return str(self.judge.generate_content([video, prompt]))
+
 
 class VideoPhy2AutoJudge:
     name = "videophy2_auto"
     s3_prefix = "models/videophy_2_auto/"
-    # The one judge whose CoT condition is OURS, not upstream's -- VideoPhy-2
-    # ships no CoT form. It is entailment-style mPLUG-Owl-Video completing
-    # "AI: " after a fixed conversation string, SFT'd on that exact template,
-    # so its CoT numbers are off-distribution in a way vila's and phyjudge's
-    # are not. Report them as a separate condition, never pooled with those.
-    supports_cot = True
-
-    def __init__(self, num_frames=VP2_NUM_FRAMES, cot=False):
+    def __init__(self, num_frames=VP2_NUM_FRAMES):
         self.num_frames = num_frames
-        self.cot = cot
         self.torch = None
         self.model = None
 
@@ -583,9 +527,6 @@ class VideoPhy2AutoJudge:
         self.model = self.model.to("cuda").to(torch.bfloat16)
 
     def build_prompt(self, call_id, caption):
-        if self.cot:
-            return (PROMPT_SA_COT.format(caption=caption) if call_id == "SA"
-                    else PROMPT_PHYSICS_COT)
         if call_id == "SA":
             return PROMPT_SA.format(caption=caption)
         return PROMPT_PHYSICS
@@ -598,12 +539,28 @@ class VideoPhy2AutoJudge:
         inputs = {k: v.bfloat16() if v.dtype == torch.float else v
                   for k, v in inputs.items()}
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        gen_kwargs = VP2_GENERATE_KWARGS_COT if self.cot else VP2_GENERATE_KWARGS
         with torch.no_grad():
-            res = self.model.generate(**inputs, **gen_kwargs)
+            res = self.model.generate(**inputs, **VP2_GENERATE_KWARGS)
         output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
-        # strict parser under CoT: vp2_parse would read "one ball" as a 1
-        return output, (vp2_parse_cot(output) if self.cot else vp2_parse(output))
+        return output, vp2_parse(output)
+
+    def rationale(self, video_path, caption, call_id, answer):
+        """Pass 2: continue the same conversation. These prompts are literal
+        transcripts ending in "AI: ", so the pass-1 answer and the request
+        append as the next two turns -- no rewriting of the scoring turn."""
+        torch = self.torch
+        prompt = ("%s%s\nHuman: %s\nAI: "
+                  % (self.build_prompt(call_id, caption), str(answer).strip(),
+                     RATIONALE_REQUEST))
+        inputs = self.processor(text=[prompt], videos=[str(video_path)],
+                                num_frames=self.num_frames, return_tensors="pt")
+        inputs = {k: v.bfloat16() if v.dtype == torch.float else v
+                  for k, v in inputs.items()}
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        kwargs = dict(VP2_GENERATE_KWARGS, max_length=VP2_RATIONALE_MAX_LENGTH)
+        with torch.no_grad():
+            res = self.model.generate(**inputs, **kwargs)
+        return self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
 
 
 class ScalarFpsProcessor:
@@ -623,19 +580,11 @@ class ScalarFpsProcessor:
 class PhyJudge9BJudge:
     name = "phyjudge_9b"
     s3_prefix = "models/phyjudge-9B/"
-    # Qwen3's native thinking mode, enabled on the chat template. The
-    # prompts stay exactly what the repo's infer.py renders.
-    supports_cot = True
-
     def __init__(self, fps=PHYJUDGE_FPS, max_pixels=PHYJUDGE_MAX_PIXELS,
-                 max_new_tokens=None, cot=False):
+                 max_new_tokens=PHYJUDGE_MAX_NEW_TOKENS):
         self.fps = fps
         self.max_pixels = max_pixels
-        self.cot = cot
-        # CoT here is Qwen3's OWN thinking mode, not a prompt we wrote. The
-        # prompts still come from the repo's infer.py, untouched.
-        self.max_new_tokens = max_new_tokens or (
-            PHYJUDGE_MAX_NEW_TOKENS_COT if cot else PHYJUDGE_MAX_NEW_TOKENS)
+        self.max_new_tokens = max_new_tokens
         self.infer = None
 
     def call_ids(self):
@@ -691,7 +640,7 @@ class PhyJudge9BJudge:
 
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=self.cot)
+            enable_thinking=False)
         inputs = self.processor(text=[text], images=image_inputs, videos=video_inputs,
                                 padding=True, return_tensors="pt", **video_kwargs)
         return inputs.to(self.device)
@@ -710,6 +659,25 @@ class PhyJudge9BJudge:
         raw = infer.decode_generated(self.processor, inputs, generated_ids)
         return raw, infer.parse_score(raw, score_key)
 
+    def rationale(self, video_path, caption, call_id, answer):
+        """Pass 2: the same messages infer.py builds, plus the answer it gave
+        and the request, as two more turns. enable_thinking stays False."""
+        infer = self.infer
+        metric = call_id if call_id in PHYJUDGE_GENERAL_KEYS else None
+        law = None if metric else call_id
+        system_prompt, user_prompt, _score_key = infer.build_prompt(
+            self.cfg, caption, metric=metric, law=law)
+        messages = list(infer.build_messages(system_prompt, user_prompt,
+                                             Path(video_path)))
+        messages += [{"role": "assistant", "content": str(answer).strip()},
+                     {"role": "user", "content": RATIONALE_REQUEST}]
+        inputs = self.prepare_inputs(messages)
+        with self.torch.inference_mode():
+            generated_ids = self.model.generate(
+                **inputs, max_new_tokens=PHYJUDGE_RATIONALE_MAX_NEW_TOKENS,
+                do_sample=False)
+        return infer.decode_generated(self.processor, inputs, generated_ids)
+
 
 JUDGES = {
     "vila_ewm": VilaEwmJudge,
@@ -724,7 +692,7 @@ def video_key_for(dataset, source_key, variant):
 
 
 def result_key(model, dataset, source_key):
-    prefix = COT_RESULT_PREFIX if COT else RESULT_PREFIX
+    prefix = PASS2_RESULT_PREFIX if PASS2 else RESULT_PREFIX
     return f"{prefix}/{model}/{dataset}/{Path(source_key).stem}.json"
 
 
@@ -758,8 +726,16 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
     key = result_key(judge.name, dataset, source_key)
     record = get_json(key) or {
         "model": judge.name, "dataset": dataset, "clip": Path(source_key).stem,
-        "source_key": source_key, "caption": caption, "pass": 1, "runs": {},
+        "source_key": source_key, "caption": caption,
+        "pass": 2 if PASS2 else 1, "runs": {},
     }
+    # Pass 2 quotes pass 1's answer back rather than regenerating it, so a call
+    # with no pass-1 result has nothing to explain and is skipped.
+    prior = {}
+    if PASS2:
+        p1 = get_json(f"{RESULT_PREFIX}/{judge.name}/{dataset}/"
+                      f"{Path(source_key).stem}.json") or {}
+        prior = p1.get("runs", {})
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     calls_run = 0
@@ -774,10 +750,24 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
             run = record["runs"].setdefault(
                 variant, {"video_key": video_key, "caption": caption, "calls": {}})
             for call_id in call_ids:
+                if PASS2:
+                    p1call = prior.get(variant, {}).get("calls", {}).get(call_id)
+                    if not p1call or p1call.get("raw") is None:
+                        print(f"  skip {variant}/{call_id}: no pass-1 answer")
+                        continue
                 calls_run += 1
                 try:
-                    raw, parsed = judge.run(local, caption, call_id)
-                    run["calls"][call_id] = {"raw": raw, "parsed": parsed}
+                    if PASS2:
+                        text = judge.rationale(local, caption, call_id,
+                                               p1call["raw"])
+                        run["calls"][call_id] = {
+                            "raw": text,
+                            "answer": p1call["raw"],
+                            "parsed": p1call.get("parsed"),
+                        }
+                    else:
+                        raw, parsed = judge.run(local, caption, call_id)
+                        run["calls"][call_id] = {"raw": raw, "parsed": parsed}
                 except Exception as e:
                     print(f"  FAILED {variant}/{call_id}: {e}")
             print(f"  {variant}: " + str(
@@ -832,47 +822,32 @@ def show_results(df):
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                rebuild_captions=False, show=None, shard=None,
-               require_attacks=True, cot=False):
-    """cot=True runs the judges' OWN chain-of-thought forms and writes to
-    COT_RESULT_PREFIX, never mixing with the greedy records in results/pass1.
+               require_attacks=True, pass2=False):
+    """pass2=True asks each judge to justify the score it already gave.
 
-    Two of the three use their own CoT form, unmodified. vila_ewm simply stops
-    rewriting upstream's "Let's think step-by-step and conclude with ..." into
-    "Answer with" -- WorldModelBench ships both, and `--cot` being store_true
-    is the only reason off is the default. phyjudge_9b turns on Qwen3's own
-    thinking mode and raises the token budget so the JSON is not truncated
-    behind the reasoning.
+    Pass 2 is score + rationale, NOT chain-of-thought. The reasoning
+    configuration is identical to pass 1 and identical across all three
+    judges: no thinking mode, no step-by-step instruction, no "explain before
+    you rate". The scoring turn is reused verbatim, the pass-1 answer is
+    quoted back rather than regenerated, and RATIONALE_REQUEST is appended as
+    the next turn -- so the score being explained is exactly the score pass 1
+    recorded, and the two passes remain comparable. Reasoning before answering
+    would change the score and leave nothing controlled to compare.
 
-    videophy2_auto is the exception and must be read as one: VideoPhy-2 ships
-    no CoT form, so PROMPT_*_COT are OURS. Its CoT numbers are off-distribution
-    in a way the other two are not -- report them as a separate condition,
-    never pooled with vila's or phyjudge's. It also swaps in vp2_parse_cot,
-    because the greedy parser substring-matches number words and would read
-    "the video shows one ball" as a score of 1.
-
-    Motivation is arXiv 2503.03064: CoT sharpens the judgment distribution
-    (they measure a strictly lower standard deviation) and shifts the mean, so
-    a judge's gameability under CoT is a different measurement, not a better
-    one. That is why this is a parallel prefix and not a replacement.
+    Results go to PASS2_RESULT_PREFIX. A call with no pass-1 answer is skipped
+    with a printed reason rather than scored, so pass 2 can never invent a
+    record pass 1 does not have.
     """
-    global COT
+    global PASS2
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
     show = (not push_to_s3) if show is None else show
 
-    COT = bool(cot)
-    if COT:
-        blocked = [m for m in models if not getattr(JUDGES[m], "supports_cot", False)]
-        if blocked:
-            print(f"cot=True: skipping {blocked} -- no upstream CoT form; "
-                  f"see supports_cot in judge_harness.py")
-            models = [m for m in models if m not in blocked]
-        if not models:
-            print("cot=True: nothing left to run")
-            return results_frame([])
-        print(f"CoT ON -- writing to s3://{BUCKET}/{COT_RESULT_PREFIX}/ "
-              f"(results/pass1 is untouched)")
+    PASS2 = bool(pass2)
+    if PASS2:
+        print(f"PASS 2 (score + rationale) -- writing to "
+              f"s3://{BUCKET}/{PASS2_RESULT_PREFIX}/ (pass 1 is untouched)")
 
     captions = build_caption_manifest(dataset, rebuild=rebuild_captions)
     source_keys = list_source_videos(dataset)
@@ -902,7 +877,7 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     records = []
     for model in models:
-        judge = JUDGES[model](cot=True) if COT else JUDGES[model]()
+        judge = JUDGES[model]()
         call_ids = judge.call_ids()
         shard_note = f", shard={shard[0]}/{shard[1]}" if shard else ""
         print(f"\n########## {judge.name} (dataset={dataset}, clips={num_clips}, "
