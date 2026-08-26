@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -45,9 +46,25 @@ PASS2 = False  # set by run_judges(pass2=...); read by result_key()
 # reasons BEFORE answering changes the score itself and there is no longer a
 # controlled comparison to make. One shared wording for the same reason: three
 # judges asked three different questions cannot be compared to each other.
+# ONE sentence, appended to every judge's own prompt unchanged, in a single
+# generation. Order is the whole design: the answer comes FIRST and is then
+# justified. That is what makes this score + rationale rather than CoT --
+# reasoning first would change the score, which is exactly what pass 2 exists
+# to measure and must therefore not do to itself.
 RATIONALE_REQUEST = (
-    "Explain why and how you arrived at that answer for this video."
+    " Give your answer first, exactly in the format requested above, then on "
+    "the next line explain why and how you arrived at it."
 )
+
+# Pass 1's parsers read the whole reply, so they cannot survive a rationale
+# after the answer: vila's yes/no check is `"no" in pred.lower()`, and "no" is
+# inside "not", "nothing" and "cannot", so almost any prose reads as a
+# violation; videophy2's scans a dict of number WORDS in dict order rather than
+# by position, so "there is one ball" wins over a leading "3". Pass 2 therefore
+# parses POSITIONALLY -- first answer token, everything after it ignored.
+_P2_SCORE_RE = re.compile(r"score\s*[:=]\s*(-?[0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_P2_YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+_P2_INT_RE = re.compile(r"\b([1-5])\b")
 MANIFEST_PREFIX = "manifests"
 
 DATASET_PREFIXES = {
@@ -428,8 +445,9 @@ class VilaEwmJudge:
     name = "vila_ewm"
     s3_prefix = "models/vila-ewm-qwen2-1.5b/"
 
-    def __init__(self, cot=WMB_COT):
+    def __init__(self, cot=WMB_COT, pass2=False):
         self.cot = cot
+        self.pass2 = pass2
         self.llava = None
         self.judge = None
 
@@ -464,9 +482,13 @@ class VilaEwmJudge:
             ).replace(
                 "Let's analyze step-by-step and conclude with", "Answer with"
             )
+        if self.pass2:
+            prompt += RATIONALE_REQUEST
         return prompt
 
     def parse(self, call_id, pred):
+        if self.pass2:
+            return self.parse_pass2(call_id, pred)
         if call_id == "instruction":
             try:
                 return float(pred.split(":")[-1].strip(" ."))
@@ -474,29 +496,34 @@ class VilaEwmJudge:
                 return None
         return "no" in pred.lower()
 
+    def parse_pass2(self, call_id, pred):
+        """Positional: the FIRST answer, rationale ignored.
+
+        Upstream's yes/no test is a substring check for "no", which also fires
+        inside "not"/"nothing"/"cannot" -- unusable once prose follows. The
+        boolean keeps upstream's polarity: True means no violation found."""
+        if call_id == "instruction":
+            m = _P2_SCORE_RE.search(pred or "")
+            if m:
+                return float(m.group(1))
+            m = _P2_INT_RE.search(pred or "")
+            return float(m.group(1)) if m else None
+        m = _P2_YESNO_RE.search(pred or "")
+        return (m.group(1).lower() == "no") if m else None
+
     def run(self, video_path, caption, call_id):
         prompt = self.build_prompt(call_id, caption)
         video = self.llava.Video(str(video_path))
         pred = str(self.judge.generate_content([video, prompt]))
         return pred, self.parse(call_id, pred)
 
-    def rationale(self, video_path, caption, call_id, answer):
-        """Pass 2: the pass-1 question, the answer it gave, then the request.
-
-        The scoring prompt is reused verbatim and the score is not regenerated
-        -- it is quoted back from pass 1 -- so nothing about how that score was
-        produced changes."""
-        prompt = "%s\n%s\n%s" % (self.build_prompt(call_id, caption),
-                                  str(answer).strip(), RATIONALE_REQUEST)
-        video = self.llava.Video(str(video_path))
-        return str(self.judge.generate_content([video, prompt]))
-
 
 class VideoPhy2AutoJudge:
     name = "videophy2_auto"
     s3_prefix = "models/videophy_2_auto/"
-    def __init__(self, num_frames=VP2_NUM_FRAMES):
+    def __init__(self, num_frames=VP2_NUM_FRAMES, pass2=False):
         self.num_frames = num_frames
+        self.pass2 = pass2
         self.torch = None
         self.model = None
 
@@ -527,9 +554,13 @@ class VideoPhy2AutoJudge:
         self.model = self.model.to("cuda").to(torch.bfloat16)
 
     def build_prompt(self, call_id, caption):
-        if call_id == "SA":
-            return PROMPT_SA.format(caption=caption)
-        return PROMPT_PHYSICS
+        base = (PROMPT_SA.format(caption=caption) if call_id == "SA"
+                else PROMPT_PHYSICS)
+        if not self.pass2:
+            return base
+        # the trailing "AI: " must stay last -- the model completes it
+        head, sep, tail = base.rpartition("\nAI: ")
+        return head + RATIONALE_REQUEST + sep + tail
 
     def run(self, video_path, caption, call_id):
         torch = self.torch
@@ -539,28 +570,17 @@ class VideoPhy2AutoJudge:
         inputs = {k: v.bfloat16() if v.dtype == torch.float else v
                   for k, v in inputs.items()}
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            res = self.model.generate(**inputs, **VP2_GENERATE_KWARGS)
-        output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
-        return output, vp2_parse(output)
-
-    def rationale(self, video_path, caption, call_id, answer):
-        """Pass 2: continue the same conversation. These prompts are literal
-        transcripts ending in "AI: ", so the pass-1 answer and the request
-        append as the next two turns -- no rewriting of the scoring turn."""
-        torch = self.torch
-        prompt = ("%s%s\nHuman: %s\nAI: "
-                  % (self.build_prompt(call_id, caption), str(answer).strip(),
-                     RATIONALE_REQUEST))
-        inputs = self.processor(text=[prompt], videos=[str(video_path)],
-                                num_frames=self.num_frames, return_tensors="pt")
-        inputs = {k: v.bfloat16() if v.dtype == torch.float else v
-                  for k, v in inputs.items()}
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        kwargs = dict(VP2_GENERATE_KWARGS, max_length=VP2_RATIONALE_MAX_LENGTH)
+        kwargs = (dict(VP2_GENERATE_KWARGS, max_length=VP2_RATIONALE_MAX_LENGTH)
+                  if self.pass2 else VP2_GENERATE_KWARGS)
         with torch.no_grad():
             res = self.model.generate(**inputs, **kwargs)
-        return self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
+        output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
+        if self.pass2:
+            # positional: vp2_parse scans number WORDS in dict order, not by
+            # position, so "there is one ball" would beat a leading "3"
+            m = _P2_INT_RE.search(output or "")
+            return output, (int(m.group(1)) if m else None)
+        return output, vp2_parse(output)
 
 
 class ScalarFpsProcessor:
@@ -581,10 +601,12 @@ class PhyJudge9BJudge:
     name = "phyjudge_9b"
     s3_prefix = "models/phyjudge-9B/"
     def __init__(self, fps=PHYJUDGE_FPS, max_pixels=PHYJUDGE_MAX_PIXELS,
-                 max_new_tokens=PHYJUDGE_MAX_NEW_TOKENS):
+                 max_new_tokens=None, pass2=False):
         self.fps = fps
         self.max_pixels = max_pixels
-        self.max_new_tokens = max_new_tokens
+        self.pass2 = pass2
+        self.max_new_tokens = max_new_tokens or (
+            PHYJUDGE_RATIONALE_MAX_NEW_TOKENS if pass2 else PHYJUDGE_MAX_NEW_TOKENS)
         self.infer = None
 
     def call_ids(self):
@@ -651,6 +673,8 @@ class PhyJudge9BJudge:
         law = None if metric else call_id
         system_prompt, user_prompt, score_key = infer.build_prompt(
             self.cfg, caption, metric=metric, law=law)
+        if self.pass2:
+            user_prompt = user_prompt + RATIONALE_REQUEST
         messages = infer.build_messages(system_prompt, user_prompt, Path(video_path))
         inputs = self.prepare_inputs(messages)
         with self.torch.inference_mode():
@@ -658,25 +682,6 @@ class PhyJudge9BJudge:
                 **inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         raw = infer.decode_generated(self.processor, inputs, generated_ids)
         return raw, infer.parse_score(raw, score_key)
-
-    def rationale(self, video_path, caption, call_id, answer):
-        """Pass 2: the same messages infer.py builds, plus the answer it gave
-        and the request, as two more turns. enable_thinking stays False."""
-        infer = self.infer
-        metric = call_id if call_id in PHYJUDGE_GENERAL_KEYS else None
-        law = None if metric else call_id
-        system_prompt, user_prompt, _score_key = infer.build_prompt(
-            self.cfg, caption, metric=metric, law=law)
-        messages = list(infer.build_messages(system_prompt, user_prompt,
-                                             Path(video_path)))
-        messages += [{"role": "assistant", "content": str(answer).strip()},
-                     {"role": "user", "content": RATIONALE_REQUEST}]
-        inputs = self.prepare_inputs(messages)
-        with self.torch.inference_mode():
-            generated_ids = self.model.generate(
-                **inputs, max_new_tokens=PHYJUDGE_RATIONALE_MAX_NEW_TOKENS,
-                do_sample=False)
-        return infer.decode_generated(self.processor, inputs, generated_ids)
 
 
 JUDGES = {
@@ -729,13 +734,6 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
         "source_key": source_key, "caption": caption,
         "pass": 2 if PASS2 else 1, "runs": {},
     }
-    # Pass 2 quotes pass 1's answer back rather than regenerating it, so a call
-    # with no pass-1 result has nothing to explain and is skipped.
-    prior = {}
-    if PASS2:
-        p1 = get_json(f"{RESULT_PREFIX}/{judge.name}/{dataset}/"
-                      f"{Path(source_key).stem}.json") or {}
-        prior = p1.get("runs", {})
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     calls_run = 0
@@ -750,24 +748,10 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
             run = record["runs"].setdefault(
                 variant, {"video_key": video_key, "caption": caption, "calls": {}})
             for call_id in call_ids:
-                if PASS2:
-                    p1call = prior.get(variant, {}).get("calls", {}).get(call_id)
-                    if not p1call or p1call.get("raw") is None:
-                        print(f"  skip {variant}/{call_id}: no pass-1 answer")
-                        continue
                 calls_run += 1
                 try:
-                    if PASS2:
-                        text = judge.rationale(local, caption, call_id,
-                                               p1call["raw"])
-                        run["calls"][call_id] = {
-                            "raw": text,
-                            "answer": p1call["raw"],
-                            "parsed": p1call.get("parsed"),
-                        }
-                    else:
-                        raw, parsed = judge.run(local, caption, call_id)
-                        run["calls"][call_id] = {"raw": raw, "parsed": parsed}
+                    raw, parsed = judge.run(local, caption, call_id)
+                    run["calls"][call_id] = {"raw": raw, "parsed": parsed}
                 except Exception as e:
                     print(f"  FAILED {variant}/{call_id}: {e}")
             print(f"  {variant}: " + str(
@@ -823,20 +807,22 @@ def show_results(df):
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                rebuild_captions=False, show=None, shard=None,
                require_attacks=True, pass2=False):
-    """pass2=True asks each judge to justify the score it already gave.
+    """pass2=True asks each judge to score AND justify, in one generation.
 
-    Pass 2 is score + rationale, NOT chain-of-thought. The reasoning
-    configuration is identical to pass 1 and identical across all three
-    judges: no thinking mode, no step-by-step instruction, no "explain before
-    you rate". The scoring turn is reused verbatim, the pass-1 answer is
-    quoted back rather than regenerated, and RATIONALE_REQUEST is appended as
-    the next turn -- so the score being explained is exactly the score pass 1
-    recorded, and the two passes remain comparable. Reasoning before answering
-    would change the score and leave nothing controlled to compare.
+    Pass 2 is score + rationale, NOT chain-of-thought. Each judge gets its own
+    pass-1 prompt unchanged plus one shared sentence, RATIONALE_REQUEST, and
+    produces its own score followed by the justification. Answer first,
+    explanation after: reasoning before answering would change the score, and
+    whether requiring a justification changes the score is precisely what the
+    two passes exist to compare -- so pass 2 must generate its own score
+    rather than be shown pass 1's, which would only anchor it.
 
-    Results go to PASS2_RESULT_PREFIX. A call with no pass-1 answer is skipped
-    with a printed reason rather than scored, so pass 2 can never invent a
-    record pass 1 does not have.
+    The reasoning configuration is identical between passes and across all
+    three judges: no thinking mode, no step-by-step instruction, one shared
+    request. Scores are parsed POSITIONALLY in pass 2 -- see the note by
+    RATIONALE_REQUEST for why pass 1's parsers cannot survive trailing prose.
+
+    Results go to PASS2_RESULT_PREFIX, never merged into results/pass1.
     """
     global PASS2
     if dataset not in DATASETS:
@@ -877,7 +863,7 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     records = []
     for model in models:
-        judge = JUDGES[model]()
+        judge = JUDGES[model](pass2=True) if PASS2 else JUDGES[model]()
         call_ids = judge.call_ids()
         shard_note = f", shard={shard[0]}/{shard[1]}" if shard else ""
         print(f"\n########## {judge.name} (dataset={dataset}, clips={num_clips}, "
