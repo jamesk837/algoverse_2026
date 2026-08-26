@@ -83,7 +83,13 @@ try:
     import infer                                   # may need torch; Colab has it
 
     yml = [p for p in got if p.suffix in (".yaml", ".yml")][0]
-    cfg = infer.load_yaml(str(yml))
+    # load_yaml calls .open() on what it is given, so it wants a Path, not a
+    # str -- judge_harness passes `adapter_dir / PHYJUDGE_PROMPT_YAML`. Try the
+    # str form too in case a vendored copy differs.
+    try:
+        cfg = infer.load_yaml(yml)
+    except AttributeError:
+        cfg = infer.load_yaml(str(yml))
     for metric, law in (("SA", None), (None, "gravity")):
         sysp, userp, score_key = infer.build_prompt(cfg, CAPTION,
                                                     metric=metric, law=law)
