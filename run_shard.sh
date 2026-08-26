@@ -140,12 +140,18 @@ boto3.client('sts', region_name='us-east-1').get_caller_identity()" \
 # A run that scores for hours and then 403s on every upload is the worst way to
 # learn the policy is missing a prefix. results/pass2 and results/paraphrase were
 # each granted separately from results/pass1, so check the one this run will use.
+# Only the PUT is the gate: the judges never delete, and requiring DeleteObject
+# here once blocked a run whose writes were working perfectly.
 "$FIRST_VENV/bin/python" -c "
 import boto3
 s3 = boto3.client('s3', region_name='us-east-1')
 k = '$PARA_PREFIX/_write_test'
 s3.put_object(Bucket='nickb-aarj', Key=k, Body=b'ok')
-s3.delete_object(Bucket='nickb-aarj', Key=k)"   || die "cannot write s3://nickb-aarj/$PARA_PREFIX/ -- add it to the IAM policy"
+try:
+    s3.delete_object(Bucket='nickb-aarj', Key=k)
+except Exception as e:
+    print('  note: probe object left behind (%s on DeleteObject). Harmless --'
+          ' the run only ever writes, never deletes.' % type(e).__name__)"   || die "cannot write s3://nickb-aarj/$PARA_PREFIX/ -- add it to the IAM policy"
 
 # Left to run_judges: it filters to clips that actually have rendered attacks
 # and prints the real count per dataset, which a bare listing count would
