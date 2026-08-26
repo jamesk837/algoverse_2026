@@ -344,6 +344,61 @@ def vp2_parse(output):
     return None
 
 
+def _patch_vila_video_cache():
+    """Decode each clip once per variant instead of once per call.
+
+    VILA's `generate_content` runs `extract_media`, which calls
+    `llava.utils.media._load_video(path, num_frames=..., fps=...)` every single
+    time. WorldModelBench asks 8 questions of the same clip -- 1 instruction +
+    5 physical laws + 2 common sense -- so 7 of every 8 decodes are thrown
+    away. Measured 2026-08-26 on an L40S: 5.3 s/call for a 1.5B model, i.e.
+    ~7 min per clip, nearly all of it re-reading the same mp4.
+
+    Memoized on the full argument tuple, so a different num_frames or fps is a
+    different entry and can never silently reuse the wrong frames. The cache
+    holds exactly ONE clip -- calls arrive 8-at-a-time on one path, so a
+    second entry is never useful and would just pin frame buffers in RAM.
+    A copy of the list is returned so a caller appending to it cannot corrupt
+    the cached entry.
+
+    The model input is byte-identical: same function, same arguments, same
+    frames. This changes throughput only.
+
+    Best effort by design. VILA is vendored and its internals move between
+    versions, so if the function is not where we expect, this prints and
+    returns, and the run proceeds at the old speed rather than failing.
+    """
+    try:
+        from llava.utils import media as _media
+    except Exception as exc:
+        print(f"  [vila] video cache not applied ({exc}); decoding per call")
+        return
+    if getattr(_media, "_ewm_video_cached", False):
+        return
+    orig = getattr(_media, "_load_video", None)
+    if not callable(orig):
+        print("  [vila] llava.utils.media._load_video missing; decoding per call")
+        return
+
+    state = {"key": None, "frames": None, "hits": 0, "misses": 0}
+
+    def cached(video_path, *args, **kwargs):
+        key = (str(video_path), args, tuple(sorted(kwargs.items())))
+        if key != state["key"]:
+            state["key"] = key
+            state["frames"] = orig(video_path, *args, **kwargs)
+            state["misses"] += 1
+        else:
+            state["hits"] += 1
+        frames = state["frames"]
+        return list(frames) if isinstance(frames, list) else frames
+
+    _media._load_video = cached
+    _media._ewm_video_cached = True
+    _media._ewm_video_stats = state
+    print("  [vila] video decode cached per clip (was: once per call)")
+
+
 class VilaEwmJudge:
     name = "vila_ewm"
     s3_prefix = "models/vila-ewm-qwen2-1.5b/"
@@ -369,6 +424,7 @@ class VilaEwmJudge:
         model_dir = sync_prefix(self.s3_prefix, MODEL_CACHE / self.name)
         self.llava = llava
         self.judge = llava.load(str(model_dir))
+        _patch_vila_video_cache()
 
     def build_prompt(self, call_id, caption):
         if call_id == "instruction":
