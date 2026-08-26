@@ -96,9 +96,7 @@ try:
         label = metric or law
         show("%s   PASS 1  (system)" % label, sysp)
         show("%s   PASS 1  (user)" % label, userp)
-        p2 = J._apply_rewrite(userp, "phyjudge_only")
-        anchor = "with exactly one key: %s." % score_key
-        p2 = p2.replace(anchor, anchor[:-1] + J.PHYJUDGE_RATIONALE_SUFFIX, 1)
+        p2 = J.phyjudge_pass2_prompt(userp, score_key)
         show("%s   PASS 2  (user)" % label, p2)
         print("\n   >>> score_key the parser looks for: %r" % score_key)
 except Exception as exc:

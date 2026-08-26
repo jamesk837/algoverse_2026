@@ -91,18 +91,45 @@ PASS2_REWRITES = {
                    "Answer with 'Score: [score]'" + RATIONALE_CLAUSE),
     "vila_yesno": ('Answer with "Yes" or "No".',
                    'Answer with "Yes" or "No"' + RATIONALE_CLAUSE),
-    # phyjudge's "ONLY" has to go -- leaving it in is a direct contradiction
-    # that no amount of extra instruction beats.
-    "phyjudge_only": ("Then output ONLY a JSON object",
-                      "Then output a JSON object"),
 }
-PHYJUDGE_RATIONALE_SUFFIX = (
-    ", followed by a short explanation of why and how you arrived at that score."
-)
+# phyjudge is not a phrase-format judge, it is a SCHEMA judge: its prompt ends
+# with a worked example of the JSON it must emit. Measured 2026-08-26: editing
+# only the sentence -- dropping ONLY and asking for an explanation -- changes
+# nothing, because the example still shows ONE key and the model follows the
+# demonstration over the instruction. The example is what has to change.
+PHYJUDGE_P2_SENTENCE_OLD = "Then output ONLY a JSON object with exactly one key: %s."
+PHYJUDGE_P2_SENTENCE_NEW = "Then output a JSON object with exactly two keys: %s and reason."
+PHYJUDGE_P2_REASON = '"<why you gave this score>"'
 VP2_RATIONALE_SUFFIX = (
     " Give the rating first, then a short explanation of why and how you "
     "arrived at it."
 )
+
+
+def phyjudge_pass2_prompt(user_prompt, score_key):
+    """Pass-2 form of a phyjudge prompt: two-key contract AND two-key example.
+
+    Both edits are required and the example is the load-bearing one. Raises if
+    either target is missing rather than returning a half-edited prompt --
+    a pass-2 prefix full of records that are really pass 1 is indistinguishable
+    from a pass 2 that simply had no effect, which is the thing being measured.
+    """
+    old = PHYJUDGE_P2_SENTENCE_OLD % score_key
+    if old not in user_prompt:
+        raise RuntimeError(
+            "pass 2: phyjudge key sentence %r not found; subq+human.yaml "
+            "changed" % old)
+    out = user_prompt.replace(old, PHYJUDGE_P2_SENTENCE_NEW % score_key, 1)
+    # the example is already rendered by infer.py, so single braces here
+    ex = re.compile(r'\{"%s":\s*(\d+)\}' % re.escape(score_key))
+    m = ex.search(out)
+    if not m:
+        raise RuntimeError(
+            "pass 2: phyjudge JSON example for key %r not found; the model "
+            "follows the example over the instruction, so a prompt without "
+            "the two-key example is pass 1 wearing a pass-2 prefix" % score_key)
+    two = '{"%s": %s, "reason": %s}' % (score_key, m.group(1), PHYJUDGE_P2_REASON)
+    return out[:m.start()] + two + out[m.end():]
 
 
 def _apply_rewrite(prompt, *keys):
@@ -800,17 +827,7 @@ class PhyJudge9BJudge:
         system_prompt, user_prompt, score_key = infer.build_prompt(
             self.cfg, caption, metric=metric, law=law)
         if self.pass2:
-            # drop "ONLY", then extend the key sentence rather than trailing
-            # the request after the JSON example where it reads as noise
-            user_prompt = _apply_rewrite(user_prompt, "phyjudge_only")
-            anchor = "with exactly one key: %s." % score_key
-            if anchor not in user_prompt:
-                raise RuntimeError(
-                    "pass 2: phyjudge key sentence %r not found; the YAML "
-                    "template changed" % anchor)
-            user_prompt = user_prompt.replace(
-                anchor,
-                anchor[:-1] + PHYJUDGE_RATIONALE_SUFFIX, 1)
+            user_prompt = phyjudge_pass2_prompt(user_prompt, score_key)
         messages = infer.build_messages(system_prompt, user_prompt, Path(video_path))
         inputs = self.prepare_inputs(messages)
         with self.torch.inference_mode():
