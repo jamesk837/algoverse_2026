@@ -410,6 +410,38 @@ def motion_score(path, max_frames=48, size=64):
     return float(np.mean(d) / 255.0)
 
 
+def load_motion_cache():
+    """S3 copy merged with the local one. Scores are deterministic per clip, so
+    a union is safe and either source can be missing."""
+    cache = get_json(MOTION_KEY, {}) or {}
+    local = TMP_DIR / "motion_cache.json"
+    if local.exists():
+        try:
+            cache.update(json.loads(local.read_text(encoding="utf-8")))
+        except Exception as exc:
+            print("  (local motion cache unreadable: %s)" % exc)
+    return cache
+
+
+def save_motion_cache(cache, push=True):
+    """Written even on a dry run, and after every dataset rather than at the
+    end. Motion scores are a pure derived cache -- not a decision and not an
+    output -- and re-probing them is the single most expensive thing here, so
+    discarding them because the caller said dry_run is exactly backwards: the
+    dry run is the mode you repeat while tuning quotas."""
+    if not cache:
+        return
+    local = TMP_DIR / "motion_cache.json"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(json.dumps(cache), encoding="utf-8")
+    if push:
+        try:
+            put_json(MOTION_KEY, cache)
+        except Exception as exc:
+            print("  (motion cache not pushed: %s -- kept locally at %s)"
+                  % (exc, local))
+
+
 def motion_for(dataset, pairs, cache, workers=8):
     """pairs is [(stem, source_key)]. Fills `cache` in place, keyed 'ds|stem'."""
     todo = [(s, k) for s, k in pairs if ("%s|%s" % (dataset, s)) not in cache]
@@ -532,6 +564,12 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
                         Mix them if you want both, at half the n each.
     motion_percentile   'prevalent motion' == above this percentile of the
                         probed pool. 40 keeps the top 60%.
+    motion_probe_limit  THE COST KNOB. Motion is measured by downloading and
+                        decoding a clip, so this many videos per corpus get
+                        pulled and decoded -- 300 x 3 corpora is a few minutes
+                        on a first run. Scores are cached in S3 and locally
+                        (including on a dry run), so reruns are seconds. Drop
+                        it to ~150 if you only need a stable percentile.
     raters / overlap    `overlap` of items go to EVERY rater (that is what
                         inter-rater agreement is computed on); the rest is
                         split between them, so N raters cover ~N x more items.
@@ -546,8 +584,9 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
         quotas[first] += drift
         print("  quotas rescaled to n=%d: %s" % (n, quotas))
 
+    t_start = time.time()
     with no_model_reads():
-        cache = get_json(MOTION_KEY, {}) or {}
+        cache = load_motion_cache()
         chosen, notes = [], {}
 
         for dataset, quota in quotas.items():
@@ -556,9 +595,11 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
             if dataset not in DATASET_PREFIXES:
                 raise ValueError("unknown dataset %r; known: %s"
                                  % (dataset, sorted(DATASET_PREFIXES)))
+            t0 = time.time()
             labels = human_labels(dataset)
             pool = candidates(dataset, wanted_variants)
-            print("== %s ==  %d clips with renders" % (dataset, len(pool)))
+            print("== %s ==  %d clips with renders  (listed in %.0fs)"
+                  % (dataset, len(pool), time.time() - t0))
             if not pool:
                 notes[dataset] = "no rendered clips"
                 continue
@@ -571,15 +612,20 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
                 rng.shuffle(t)
                 probe.extend(t)
             probe = probe[:motion_probe_limit]
+            t0 = time.time()
             motion_for(dataset, [(c["stem"], c["source_key"]) for c in probe], cache)
+            # save per dataset, not at the end: this is the expensive part, and
+            # a crash or a timeout three datasets in should not throw it away
+            save_motion_cache(cache, push=push)
+            t_motion = time.time() - t0
 
             def m(c):
                 return cache.get("%s|%s" % (dataset, c["stem"]))
 
             scored = [m(c) for c in probe if m(c) is not None]
             thr = float(np.percentile(scored, motion_percentile)) if scored else 0.0
-            print("  motion threshold p%d = %.4f  (probed %d)"
-                  % (motion_percentile, thr, len(scored)))
+            print("  motion threshold p%d = %.4f  (probed %d in %.0fs)"
+                  % (motion_percentile, thr, len(scored), t_motion))
 
             picked, taken, ladder = [], set(), []
             for relax_motion in (False, True):
@@ -629,13 +675,13 @@ def build_task_set(n=60, quotas=None, seed=20260825, motion_percentile=40,
         "clips": chosen,
     }
     preview(doc)
+    print("  built in %.0fs" % (time.time() - t_start))
     if dry_run:
-        print("\n  --dry-run: nothing written")
+        print("\n  --dry-run: no task set written (motion cache kept, so a "
+              "rerun is fast)")
         return doc
     if push:
         put_json(TASK_KEY_FMT.format(version=version), doc)
-        if cache:
-            put_json(MOTION_KEY, cache)
     return doc
 
 
