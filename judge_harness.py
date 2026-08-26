@@ -76,7 +76,6 @@ _P2_VIOLATION_WORDS = {"yes", "true"}
 # legitimate instruction score of 0 and can pick up a stray 4 or 5 out of the
 # explanation instead.
 _P2_INSTR_RE = re.compile(r"\b([0-3])\b")   # vila instruction
-_P2_INT_RE = re.compile(r"\b([1-5])\b")     # unused scale guard, see below
 # JSON first, prose after: upstream's parse_score never had to cope with
 # trailing text, so pass 2 retries it on the first {...} block if it comes
 # back empty.
