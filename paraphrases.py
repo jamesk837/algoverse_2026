@@ -30,6 +30,12 @@ RULES, in order of how badly they break things
      INSTRUCTION SENTENCE ONLY -- the system line, the <|video|> token and
      the trailing "AI: " are structural and get reattached.
 
+  6. PHYJUDGE ONLY: keep the DOUBLED braces in the JSON example --
+     {{"SA": 3}} is a .format() escape that renders as {"SA": 3}. Keep the
+     JSON key name too; infer.parse_score looks for it exactly. And keep
+     {questions_block}, which injects the sub-question checklist the model
+     was fine-tuned with.
+
   5. Leave a slot "" to skip it. check() reports how many are filled.
 
 CHECK YOUR WORK BEFORE A RUN
@@ -216,20 +222,178 @@ VP2_INSTRUCTIONS = {
 
 
 # ===========================================================================
-# phyjudge_9b -- NOT YET POPULATED
+# phyjudge_9b -- 5 templates (NOT 16)
 # ---------------------------------------------------------------------------
-# Its prompts are not in this repo. PhyJudge9BJudge puts the mirrored repo on
-# sys.path and calls that repo's own infer.py against the subq+human.yaml
-# shipped beside the adapter, so the text lives in the YAML plus
-# infer.GENERAL_SUB_QUESTIONS / infer.PHYSICAL_SUB_QUESTIONS.
+# From models/phyjudge-9B/subq+human.yaml. The 13 physical laws all share ONE
+# template -- `physical_template` -- with {law} and {criteria} substituted per
+# law, so there are five things to reword, not sixteen.
 #
-# Dump it on a box that has the mirror (no GPU needed):
-#     cat models_cache/phyjudge_9b/subq+human.yaml
+# These are the only prompts that do not live in judge_harness. infer.py
+# renders them from that YAML, so a paraphrase here means swapping the YAML
+# value before build_prompt runs, not editing a string in our code.
 #
-# Paste that back and the 3 general dims + 13 laws get slots here.
+# THREE TRAPS, all of which fail silently:
+#
+#   * DOUBLED BRACES. `{{"SA": 3}}` is a .format() escape that renders as
+#     {"SA": 3}. A single brace there is either a KeyError or a vanished
+#     example. Keep them doubled.
+#
+#   * THE JSON KEY NAME IS THE PARSER'S CONTRACT. infer.parse_score(raw,
+#     score_key) looks for exactly "SA" / "PTV" / "persistence" / the law
+#     name. Reword the instruction around it however you like; do not rename
+#     the key or translate it.
+#
+#   * {questions_block} IS THE SUB-QUESTION CHECKLIST, injected from
+#     infer.GENERAL_SUB_QUESTIONS / infer.PHYSICAL_SUB_QUESTIONS. Dropping it
+#     silently removes the checklists this model was fine-tuned with -- an
+#     earlier version of the harness had exactly that bug.
+#
+# The 1-5 anchors are the rubric; rewording the descriptions is fair game,
+# renumbering them is not.
 # ===========================================================================
 
-PHYJUDGE_CRITERIA = {}
+PHYJUDGE_PROMPTS = {
+    "system_prompt": {
+        "original": "You are a strict video evaluation model.",
+        "paraphrases": [
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+    },
+    "SA": {
+        "original": """\
+Evaluate Prompt Alignment (SA).
+
+Caption:
+"{prompt}"
+
+The video was generated using a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt above.
+
+Sub-questions to consider in your mind before scoring:
+{questions_block}
+
+Score 1-5:
+5=fully aligned
+4=mostly aligned with minor deviations
+3=partially aligned with notable gaps
+2=mostly misaligned
+1=not aligned
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
+        "paraphrases": [
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+    },
+    "PTV": {
+        "original": """\
+Evaluate Temporal Coherence (PTV).
+
+Caption:
+"{prompt}"
+
+The video was generated using a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt above.
+
+Sub-questions to consider in your mind before scoring:
+{questions_block}
+
+Score 1-5:
+5=fully plausible event order
+4=mostly plausible with minor timing issues
+3=partially plausible
+2=mostly implausible
+1=completely implausible order
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
+        "paraphrases": [
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+    },
+    "persistence": {
+        "original": """\
+Evaluate Object Persistence.
+
+Caption, for context only:
+"{prompt}"
+
+The video was generated using a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt above.
+
+Sub-questions to consider in your mind before scoring:
+{questions_block}
+
+Score 1-5:
+5=fully consistent
+4=mostly consistent with minor flicker
+3=noticeable issues
+2=major inconsistencies
+1=severe disappearance or identity changes
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
+        "paraphrases": [
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+    },
+    # shared by all 13 laws: gravity, inertia, momentum, impenetrability,
+    # collision, material, buoyancy, displacement, flow_dynamics,
+    # boundary_interaction, fluid_continuity, reflection, shadow
+    "physical_template": {
+        "original": """\
+Evaluate physical realism for one physical law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, for context only:
+"{prompt}"
+
+Sub-questions to consider in your mind before scoring:
+{questions_block}
+
+Judge the video itself. Do not penalize prompt mismatch unless it affects whether this physical law can be evaluated.
+
+Score 1-5:
+5=clearly correct
+4=mostly correct with minor issues
+3=partially correct or ambiguous
+2=mostly incorrect
+1=severely incorrect
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
+        "paraphrases": [
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+    },
+}
 
 
 # ===========================================================================
@@ -238,7 +402,7 @@ _ALL = {
     "vila_templates": VILA_TEMPLATES,
     "vila_questions": VILA_QUESTIONS,
     "vp2_instructions": VP2_INSTRUCTIONS,
-    "phyjudge_criteria": PHYJUDGE_CRITERIA,
+    "phyjudge_prompts": PHYJUDGE_PROMPTS,
 }
 
 # What each entry must still contain after rewording, per SECTION -- the
@@ -255,7 +419,18 @@ _REQUIRED = {
         "SA": ["{caption}", "1 to 5"],
         "PC": ["1 to 5"],
     },
-    "phyjudge_criteria": {},
+    "phyjudge_prompts": {
+        # {questions_block} injects the sub-question checklist; the JSON key
+        # name is what infer.parse_score looks for; the doubled braces are a
+        # .format() escape for the literal JSON example.
+        "system_prompt": [],
+        "SA": ["{prompt}", "{questions_block}", "SA", "1-5", '{{"SA"'],
+        "PTV": ["{prompt}", "{questions_block}", "PTV", "1-5", '{{"PTV"'],
+        "persistence": ["{prompt}", "{questions_block}", "persistence", "1-5",
+                        '{{"persistence"'],
+        "physical_template": ["{law}", "{criteria}", "{prompt}",
+                              "{questions_block}", "1-5", '{{"{law}"'],
+    },
 }
 
 
