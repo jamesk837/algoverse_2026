@@ -51,20 +51,59 @@ PASS2 = False  # set by run_judges(pass2=...); read by result_key()
 # Pass 2 asks for a SCORE RATIONALE, and deliberately not for chain-of-thought.
 # The reasoning configuration is identical to pass 1 and identical across all
 # three judges -- no thinking mode, no "let's think step-by-step", no "explain
-# before you rate". The score is produced exactly as in pass 1 and is then
-# justified afterwards, so the two passes stay comparable; anything that
-# reasons BEFORE answering changes the score itself and there is no longer a
-# controlled comparison to make. One shared wording for the same reason: three
-# judges asked three different questions cannot be compared to each other.
-# ONE sentence, appended to every judge's own prompt unchanged, in a single
-# generation. Order is the whole design: the answer comes FIRST and is then
-# justified. That is what makes this score + rationale rather than CoT --
-# reasoning first would change the score, which is exactly what pass 2 exists
-# to measure and must therefore not do to itself.
-RATIONALE_REQUEST = (
-    " Be as objective as possible. After giving your answer, provide a short "
-    "explanation of why and how you arrived at it."
+# before you rate".
+#
+# Pass 2 EDITS each judge's format instruction rather than appending a sentence
+# after it. Appending was tried first and does not work: every judge states its
+# output contract emphatically and last, so a trailing request reads as noise.
+# phyjudge is the clearest case -- its contract is "output ONLY a JSON object",
+# and the appended sentence landed glued to the JSON example line, asking for
+# an explanation immediately after forbidding one. All three judges ignored it
+# and answered exactly as in pass 1 (measured 2026-08-26).
+#
+# So the modification is semantically identical across judges and surface-wise
+# per judge, in each one's own idiom. The alternative -- one identical string --
+# is identical text that lands as an instruction in one judge and as noise in
+# another, which is uniform in the wrong place.
+#
+# Order is still the whole design: the answer comes FIRST and is then
+# justified. Reasoning first is CoT, it moves the score, and moving the score
+# is what pass 2 exists to measure and must not do to itself.
+RATIONALE_CLAUSE = ", then a short explanation of why and how you arrived at it."
+
+# (old, new) applied to a pass-1 prompt to produce the pass-2 prompt. Each
+# targets that judge's final format instruction.
+PASS2_REWRITES = {
+    "vila_score": ("Answer with 'Score: [score]'.",
+                   "Answer with 'Score: [score]'" + RATIONALE_CLAUSE),
+    "vila_yesno": ('Answer with "Yes" or "No".',
+                   'Answer with "Yes" or "No"' + RATIONALE_CLAUSE),
+    # phyjudge's "ONLY" has to go -- leaving it in is a direct contradiction
+    # that no amount of extra instruction beats.
+    "phyjudge_only": ("Then output ONLY a JSON object",
+                      "Then output a JSON object"),
+}
+PHYJUDGE_RATIONALE_SUFFIX = (
+    ", followed by a short explanation of why and how you arrived at that score."
 )
+VP2_RATIONALE_SUFFIX = (
+    " Give the rating first, then a short explanation of why and how you "
+    "arrived at it."
+)
+
+
+def _apply_rewrite(prompt, *keys):
+    """Rewrite a pass-1 prompt into its pass-2 form. Raises if the format
+    instruction is not where we expect -- silently returning the pass-1 prompt
+    would produce a whole run of pass-2 records that are really pass 1."""
+    for key in keys:
+        old, new = PASS2_REWRITES[key]
+        if old in prompt:
+            return prompt.replace(old, new, 1)
+    raise RuntimeError(
+        "pass 2: no format instruction found to rewrite (looked for %s). The "
+        "prompt changed shape; fix PASS2_REWRITES rather than shipping pass-1 "
+        "prompts under a pass-2 prefix." % list(keys))
 
 # Pass 1's parsers read the whole reply, so they cannot survive a rationale
 # after the answer: vila's yes/no check is `"no" in pred.lower()`, and "no" is
@@ -518,7 +557,7 @@ class VilaEwmJudge:
                 "Let's analyze step-by-step and conclude with", "Answer with"
             )
         if self.pass2:
-            prompt += RATIONALE_REQUEST
+            prompt = _apply_rewrite(prompt, "vila_score", "vila_yesno")
         return prompt
 
     def parse(self, call_id, pred):
@@ -599,7 +638,7 @@ class VideoPhy2AutoJudge:
             return base
         # the trailing "AI: " must stay last -- the model completes it
         head, sep, tail = base.rpartition("\nAI: ")
-        return head + RATIONALE_REQUEST + sep + tail
+        return head + VP2_RATIONALE_SUFFIX + sep + tail
 
     def run(self, video_path, caption, call_id):
         torch = self.torch
@@ -713,7 +752,17 @@ class PhyJudge9BJudge:
         system_prompt, user_prompt, score_key = infer.build_prompt(
             self.cfg, caption, metric=metric, law=law)
         if self.pass2:
-            user_prompt = user_prompt + RATIONALE_REQUEST
+            # drop "ONLY", then extend the key sentence rather than trailing
+            # the request after the JSON example where it reads as noise
+            user_prompt = _apply_rewrite(user_prompt, "phyjudge_only")
+            anchor = "with exactly one key: %s." % score_key
+            if anchor not in user_prompt:
+                raise RuntimeError(
+                    "pass 2: phyjudge key sentence %r not found; the YAML "
+                    "template changed" % anchor)
+            user_prompt = user_prompt.replace(
+                anchor,
+                anchor[:-1] + PHYJUDGE_RATIONALE_SUFFIX, 1)
         messages = infer.build_messages(system_prompt, user_prompt, Path(video_path))
         inputs = self.prepare_inputs(messages)
         with self.torch.inference_mode():
@@ -859,8 +908,10 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     """pass2=True asks each judge to score AND justify, in one generation.
 
     Pass 2 is score + rationale, NOT chain-of-thought. Each judge gets its own
-    pass-1 prompt unchanged plus one shared sentence, RATIONALE_REQUEST, and
-    produces its own score followed by the justification. Answer first,
+    pass-1 prompt with its FORMAT INSTRUCTION rewritten to ask for the answer
+    and then a justification -- see PASS2_REWRITES for why appending a sentence
+    after it does not work. Each judge produces its own score followed by the
+    justification. Answer first,
     explanation after: reasoning before answering would change the score, and
     whether requiring a justification changes the score is precisely what the
     two passes exist to compare -- so pass 2 must generate its own score
@@ -869,7 +920,7 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     The reasoning configuration is identical between passes and across all
     three judges: no thinking mode, no step-by-step instruction, one shared
     request. Scores are parsed POSITIONALLY in pass 2 -- see the note by
-    RATIONALE_REQUEST for why pass 1's parsers cannot survive trailing prose.
+    _P2_YESNO_RE for why pass 1's parsers cannot survive trailing prose.
 
     Results go to PASS2_RESULT_PREFIX, never merged into results/pass1.
     """

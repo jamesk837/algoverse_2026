@@ -96,7 +96,10 @@ try:
         label = metric or law
         show("%s   PASS 1  (system)" % label, sysp)
         show("%s   PASS 1  (user)" % label, userp)
-        show("%s   PASS 2  (user)" % label, userp + J.RATIONALE_REQUEST)
+        p2 = J._apply_rewrite(userp, "phyjudge_only")
+        anchor = "with exactly one key: %s." % score_key
+        p2 = p2.replace(anchor, anchor[:-1] + J.PHYJUDGE_RATIONALE_SUFFIX, 1)
+        show("%s   PASS 2  (user)" % label, p2)
         print("\n   >>> score_key the parser looks for: %r" % score_key)
 except Exception as exc:
     print("could not render phyjudge's prompts: %s: %s" % (type(exc).__name__, exc))
@@ -122,6 +125,9 @@ except Exception as exc:
         print("  and the YAML could not be read either: %s" % exc2)
 
 print("\n" + BAR)
-print("pass 2 appends this one sentence, identically, to every judge and every call:")
-print("  %r" % J.RATIONALE_REQUEST)
+print("pass 2 REWRITES each judge's format instruction (appending after it does")
+print("not work -- every judge states its output contract emphatically and last):")
+for k, (old, new) in J.PASS2_REWRITES.items():
+    print("  %-14s %r" % (k, old))
+    print("  %-14s -> %r" % ("", new))
 print(BAR)
