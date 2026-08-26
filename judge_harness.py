@@ -47,6 +47,19 @@ RESULT_PREFIX = "results/pass1"
 # stats / monitor read it by pointing their own RESULT_PREFIX here.
 PASS2_RESULT_PREFIX = "results/pass2"
 PASS2 = False  # set by run_judges(pass2=...); read by result_key()
+# Prompt-paraphrase run: same calls, same parsing, same decoding as pass 1,
+# with each judge's prompt swapped for reworded index k. Results go to their
+# own prefix -- checkpointing is per (clip, variant, call), so merging them
+# into results/pass1 would fold paraphrased answers into pass-1 records.
+PARAPHRASE_RESULT_PREFIX = "results/paraphrase"
+PARAPHRASE = None  # set by run_judges(paraphrase=k); read by result_key()
+
+
+def _paraphrases():
+    """Lazy so this file still runs pasted into a bare cell without it."""
+    import paraphrases
+    return paraphrases
+
 
 # Pass 2 asks for a SCORE RATIONALE, and deliberately not for chain-of-thought.
 # The reasoning configuration is identical to pass 1 and identical across all
@@ -519,9 +532,26 @@ class VilaEwmJudge:
     name = "vila_ewm"
     s3_prefix = "models/vila-ewm-qwen2-1.5b/"
 
-    def __init__(self, cot=WMB_COT, pass2=False):
+    def __init__(self, cot=WMB_COT, pass2=False, paraphrase=None):
         self.cot = cot
         self.pass2 = pass2
+        self.paraphrase = paraphrase
+        # BOTH the templates and the question pool are paraphrased -- the
+        # questions are interpolated INTO the templates, so swapping only one
+        # would be a half-reworded prompt.
+        if paraphrase is None:
+            self.templates = WMB_PROMPT_TEMPLATES
+            self.questions = WMB_QUESTION_POOL
+        else:
+            P = _paraphrases()
+            self.templates = {k: P.VILA_TEMPLATES[k]["paraphrases"][paraphrase]
+                              for k in WMB_PROMPT_TEMPLATES}
+            # "instruction" maps to None -- it is a template, not a pool
+            self.questions = {
+                g: (qs if not qs else
+                    [P.VILA_QUESTIONS["%s_%d" % (g, i)]["paraphrases"][paraphrase]
+                     for i in range(len(qs))])
+                for g, qs in WMB_QUESTION_POOL.items()}
         self.llava = None
         self.judge = None
 
@@ -545,11 +575,11 @@ class VilaEwmJudge:
 
     def build_prompt(self, call_id, caption):
         if call_id == "instruction":
-            prompt = WMB_PROMPT_TEMPLATES["instruction"].format(instruction=caption)
+            prompt = self.templates["instruction"].format(instruction=caption)
         else:
             eval_type, idx = call_id.rsplit("_", 1)
-            question = WMB_QUESTION_POOL[eval_type][int(idx)]
-            prompt = WMB_PROMPT_TEMPLATES[eval_type].format(**{eval_type: question.lower()})
+            question = self.questions[eval_type][int(idx)]
+            prompt = self.templates[eval_type].format(**{eval_type: question.lower()})
         if not self.cot:
             prompt = prompt.replace(
                 "Let's think step-by-step and conclude with", "Answer with"
@@ -599,9 +629,10 @@ class VilaEwmJudge:
 class VideoPhy2AutoJudge:
     name = "videophy2_auto"
     s3_prefix = "models/videophy_2_auto/"
-    def __init__(self, num_frames=VP2_NUM_FRAMES, pass2=False):
+    def __init__(self, num_frames=VP2_NUM_FRAMES, pass2=False, paraphrase=None):
         self.num_frames = num_frames
         self.pass2 = pass2
+        self.paraphrase = paraphrase
         self.torch = None
         self.model = None
 
@@ -634,6 +665,20 @@ class VideoPhy2AutoJudge:
     def build_prompt(self, call_id, caption):
         base = (PROMPT_SA.format(caption=caption) if call_id == "SA"
                 else PROMPT_PHYSICS)
+        if self.paraphrase is not None:
+            # the paraphrase is the INSTRUCTION SENTENCE only; the system line,
+            # the <|video|> token and the trailing "AI: " are structural
+            entry = _paraphrases().VP2_INSTRUCTIONS[call_id]
+            old = entry["original"]
+            new = entry["paraphrases"][self.paraphrase]
+            if call_id == "SA":
+                old = old.format(caption=caption)
+                new = new.format(caption=caption)
+            if old not in base:
+                raise RuntimeError(
+                    "paraphrase: videophy2 %s instruction not found in the "
+                    "prompt; paraphrases.py has drifted" % call_id)
+            base = base.replace(old, new, 1)
         if not self.pass2:
             return base
         # the trailing "AI: " must stay last -- the model completes it
@@ -679,10 +724,11 @@ class PhyJudge9BJudge:
     name = "phyjudge_9b"
     s3_prefix = "models/phyjudge-9B/"
     def __init__(self, fps=PHYJUDGE_FPS, max_pixels=PHYJUDGE_MAX_PIXELS,
-                 max_new_tokens=None, pass2=False):
+                 max_new_tokens=None, pass2=False, paraphrase=None):
         self.fps = fps
         self.max_pixels = max_pixels
         self.pass2 = pass2
+        self.paraphrase = paraphrase
         self.max_new_tokens = max_new_tokens or (
             PHYJUDGE_RATIONALE_MAX_NEW_TOKENS if pass2 else PHYJUDGE_MAX_NEW_TOKENS)
         self.infer = None
@@ -709,6 +755,8 @@ class PhyJudge9BJudge:
             str(model_dir), dtype=torch.bfloat16, device_map="auto")
         self.processor = ScalarFpsProcessor(processor)
         self.cfg = infer.load_yaml(adapter_dir / PHYJUDGE_PROMPT_YAML)
+        if self.paraphrase is not None:
+            self.cfg = _paraphrase_phyjudge_cfg(self.cfg, self.paraphrase)
         self.device = next(self.model.parameters()).device
         unknown = [c for c in self.call_ids()
                    if c not in infer.GENERAL_SUB_QUESTIONS and c not in infer.PHYSICAL_CRITERIA]
@@ -794,8 +842,52 @@ def video_key_for(dataset, source_key, variant):
     return f"attacks/{dataset}/{Path(source_key).stem}/{variant}.mp4"
 
 
+def _paraphrase_phyjudge_cfg(cfg, k):
+    """Swap phyjudge's 5 YAML templates for reworded index k.
+
+    phyjudge's prompts are the one set that does not live in this file --
+    infer.py renders them from subq+human.yaml -- so the swap is a recursive
+    string replace on the loaded cfg rather than an edit to a constant here.
+    Raises if a template is not found: silently scoring with the ORIGINAL
+    prompt under a paraphrase prefix would be indistinguishable from a
+    paraphrase that simply had no effect, which is the result being measured.
+    """
+    import copy
+
+    P = _paraphrases()
+    pairs = [(e["original"], e["paraphrases"][k])
+             for e in P.PHYJUDGE_PROMPTS.values()]
+    hits = {old: 0 for old, _ in pairs}
+
+    def walk(o):
+        if isinstance(o, dict):
+            return {kk: walk(vv) for kk, vv in o.items()}
+        if isinstance(o, list):
+            return [walk(vv) for vv in o]
+        if isinstance(o, str):
+            for old, new in pairs:
+                if old in o:
+                    hits[old] += 1
+                    o = o.replace(old, new)
+        return o
+
+    out = walk(copy.deepcopy(cfg))
+    missed = [old[:40] for old, c in hits.items() if c == 0]
+    if missed:
+        raise RuntimeError(
+            "paraphrase: %d phyjudge template(s) not found in the loaded YAML "
+            "(%s); paraphrases.py has drifted from subq+human.yaml"
+            % (len(missed), missed))
+    return out
+
+
 def result_key(model, dataset, source_key):
-    prefix = PASS2_RESULT_PREFIX if PASS2 else RESULT_PREFIX
+    if PARAPHRASE is not None:
+        prefix = f"{PARAPHRASE_RESULT_PREFIX}/p{PARAPHRASE}"
+    elif PASS2:
+        prefix = PASS2_RESULT_PREFIX
+    else:
+        prefix = RESULT_PREFIX
     return f"{prefix}/{model}/{dataset}/{Path(source_key).stem}.json"
 
 
@@ -904,7 +996,7 @@ def show_results(df):
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                rebuild_captions=False, show=None, shard=None,
-               require_attacks=True, pass2=False):
+               require_attacks=True, pass2=False, paraphrase=None):
     """pass2=True asks each judge to score AND justify, in one generation.
 
     Pass 2 is score + rationale, NOT chain-of-thought. Each judge gets its own
@@ -924,12 +1016,31 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     Results go to PASS2_RESULT_PREFIX, never merged into results/pass1.
     """
-    global PASS2
+    global PASS2, PARAPHRASE
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
     show = (not push_to_s3) if show is None else show
 
+    if paraphrase is not None:
+        if pass2:
+            raise ValueError(
+                "paraphrase and pass2 are separate experiments and share no "
+                "prefix; run them one at a time")
+        P = _paraphrases()
+        if not isinstance(paraphrase, int) or not 0 <= paraphrase < P.N_PARAPHRASES:
+            raise ValueError("paraphrase must be an int in 0..%d"
+                             % (P.N_PARAPHRASES - 1))
+        problems = P.check(verbose=False)
+        if problems:
+            raise RuntimeError(
+                "paraphrases.py failed validation (%d problem(s)); fix before "
+                "spending GPU time: %s" % (len(problems), problems[:3]))
+    PARAPHRASE = paraphrase
+    if PARAPHRASE is not None:
+        print(f"PARAPHRASE {PARAPHRASE} -- same calls/decoding/parsing as pass 1, "
+              f"reworded prompts -> "
+              f"s3://{BUCKET}/{PARAPHRASE_RESULT_PREFIX}/p{PARAPHRASE}/")
     PASS2 = bool(pass2)
     if PASS2:
         print(f"PASS 2 (score + rationale) -- writing to "
@@ -963,7 +1074,10 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     records = []
     for model in models:
-        judge = JUDGES[model](pass2=True) if PASS2 else JUDGES[model]()
+        if PARAPHRASE is not None:
+            judge = JUDGES[model](paraphrase=PARAPHRASE)
+        else:
+            judge = JUDGES[model](pass2=True) if PASS2 else JUDGES[model]()
         call_ids = judge.call_ids()
         shard_note = f", shard={shard[0]}/{shard[1]}" if shard else ""
         print(f"\n########## {judge.name} (dataset={dataset}, clips={num_clips}, "
