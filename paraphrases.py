@@ -25,8 +25,10 @@ RULES, in order of how badly they break things
      1-5. Do not renumber them.
 
   4. Indentation and the trailing wrapper are handled for you. Write the
-     vila templates as plain multi-line text; _wmb_template restores the
-     12-space continuation indent. Write the videophy2 entries as the
+     vila templates with the SAME 12-space continuation indent the
+     originals use -- _wmb_template only pads blank lines, it does not
+     indent content, so whitespace would otherwise vary alongside the
+     wording and you could not tell which moved the score. Write the videophy2 entries as the
      INSTRUCTION SENTENCE ONLY -- the system line, the <|video|> token and
      the trailing "AI: " are structural and get reattached.
 
@@ -70,54 +72,54 @@ Evaluate if this video follows the instruction: '{instruction}'.
         "paraphrases": [
             """\
 Assess whether the video adheres to the instruction: '{instruction}'.
-Apply this scoring rubric:
+            Apply this scoring rubric:
 
-- 0: The video has no connection to the instruction whatsoever.
-- 1: The video shows the right object performing the wrong action, or the wrong action performed on the right object.
-- 2: The video follows the instruction and moves toward the intended goal.
-- 3: The video follows the instruction exactly and fully achieves the goal.
+            - 0: The video has no connection to the instruction whatsoever.
+            - 1: The video shows the right object performing the wrong action, or the right action performed on the wrong object.
+            - 2: The video follows the instruction and moves toward the intended goal.
+            - 3: The video follows the instruction exactly and fully achieves the goal.
 
-Reason through this step-by-step, then finish with 'Score: [score]'.
+            Reason through this step-by-step, then finish with 'Score: [score]'.
 """,
             """\
 Does this video carry out the instruction '{instruction}'? Judge it against this rubric:
 
-- 0: No relation to the instruction is shown.
-- 1: Either the object or the action is correct, but not both.
-- 2: The instruction is followed and progress toward the goal is visible.
-- 3: The instruction is followed exactly and the goal is fully achieved.
+            - 0: No relation to the instruction is shown.
+            - 1: Either the object or the action is correct, but not both.
+            - 2: The instruction is followed and progress toward the goal is visible.
+            - 3: The instruction is followed exactly and the goal is fully achieved.
 
-Work through your reasoning step-by-step and end with 'Score: [score]'.
+            Work through your reasoning step-by-step and end with 'Score: [score]'.
 """,
             """\
 Instruction to check: '{instruction}'. Decide how well the video follows it using this scale:
 
-- 0: The instruction is not followed in any way.
-- 1: One part is right, either the object or the action, and the other part is wrong.
-- 2: The video is on track and follows the instruction toward the intended result.
-- 3: The instruction is followed exactly and the goal is fully reached.
+            - 0: The instruction is not followed in any way.
+            - 1: One part is right, either the object or the action, and the other part is wrong.
+            - 2: The video is on track and follows the instruction toward the intended result.
+            - 3: The instruction is followed exactly and the goal is fully reached.
 
-Think it through step-by-step, and conclude with 'Score: [score]'.
+            Think it through step-by-step, and conclude with 'Score: [score]'.
 """,
             """\
 Rate how faithfully the video executes the instruction: '{instruction}', using the criteria below.
 
-- 0: There is no sign of the instruction being followed.
-- 1: Only the object or only the action matches the instruction, not both.
-- 2: The video follows the instruction and shows real progress toward the goal.
-- 3: The video follows the instruction exactly and completes the goal successfully.
+            - 0: There is no sign of the instruction being followed.
+            - 1: Only the object or only the action matches the instruction, not both.
+            - 2: The video follows the instruction and shows real progress toward the goal.
+            - 3: The video follows the instruction exactly and completes the goal successfully.
 
-Analyze step-by-step, then give your conclusion as 'Score: [score]'.
+            Analyze step-by-step, then give your conclusion as 'Score: [score]'.
 """,
             """\
 Check the video against the instruction: '{instruction}'. Score it with this rubric:
 
-- 0: The video has nothing to do with the instruction.
-- 1: Either the object is correct and the action is wrong, or the action is correct and the object is wrong.
-- 2: The video follows the instruction and trends toward the intended outcome.
-- 3: The video follows the instruction precisely and reaches the goal.
+            - 0: The video has nothing to do with the instruction.
+            - 1: Either the object is correct and the action is wrong, or the action is correct and the object is wrong.
+            - 2: The video follows the instruction and trends toward the intended outcome.
+            - 3: The video follows the instruction precisely and reaches the goal.
 
-Step through your reasoning, then conclude with 'Score: [score]'.
+            Step through your reasoning, then conclude with 'Score: [score]'.
 """,
         ],
     },
@@ -332,11 +334,11 @@ PHYJUDGE_PROMPTS = {
     "system_prompt": {
         "original": "You are a strict video evaluation model.",
         "paraphrases": [
-            "",
-            "",
-            "",
-            "",
-            "",
+            "You are a rigorous video evaluation model.",
+            "You act as a strict, exacting evaluator of videos.",
+            "You are a demanding model that evaluates videos strictly.",
+            "You function as a stringent video-evaluation model.",
+            "You are a no-nonsense, strict evaluator of video content.",
         ],
     },
     "SA": {
@@ -363,11 +365,116 @@ Then output ONLY a JSON object with exactly one key: SA.
 Example:
 {{"SA": 3}}""",
         "paraphrases": [
-            "",
-            "",
-            "",
-            "",
-            "",
+            """\
+Assess how well the video aligns with the prompt (SA).
+
+Caption:
+"{prompt}"
+
+This video comes from a text+image-to-video (ti2v) model that was conditioned on the first frame together with the text prompt above.
+
+Before scoring, work through these sub-questions in your mind:
+{questions_block}
+
+Score on a 1-5 scale:
+5=fully aligned with the caption
+4=mostly aligned, with small deviations
+3=partially aligned, with clear gaps
+2=largely misaligned
+1=no alignment
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
+            """\
+Rate Prompt Alignment (SA) for this video.
+
+Caption:
+"{prompt}"
+
+The clip was produced by a text+image-to-video (ti2v) model, conditioned on both the first frame and the caption above.
+
+Consider these sub-questions before you assign a score:
+{questions_block}
+
+Use a 1-5 scale:
+5=perfectly matches the caption
+4=mostly matches, minor deviations only
+3=partial match, with notable gaps
+2=mostly does not match
+1=does not match at all
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
+            """\
+Judge Prompt Alignment (SA) between the video and its caption.
+
+Caption:
+"{prompt}"
+
+This is output from a text+image-to-video (ti2v) model conditioned on the first frame and the text prompt shown above.
+
+Think through these sub-questions before scoring:
+{questions_block}
+
+Give a score of 1-5, where:
+5=fully in line with the caption
+4=mostly in line, small deviations
+3=partly in line, noticeable gaps
+2=mostly out of line
+1=completely out of line
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
+            """\
+Score Prompt Alignment (SA): how closely does the video follow the caption?
+
+Caption:
+"{prompt}"
+
+The video was generated by a text+image-to-video (ti2v) model conditioned on the first frame plus the text prompt above.
+
+Sub-questions to work through mentally before you score:
+{questions_block}
+
+Rate it 1-5:
+5=complete alignment
+4=mostly aligned, minor slip-ups
+3=partial alignment, real gaps remain
+2=mostly misaligned
+1=no meaningful alignment
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
+            """\
+Determine the Prompt Alignment (SA) score for this video.
+
+Caption:
+"{prompt}"
+
+This video was made by a text+image-to-video (ti2v) model, conditioned on the first frame together with the caption above.
+
+Before assigning a score, run through these sub-questions:
+{questions_block}
+
+Score from 1-5:
+5=matches the caption fully
+4=matches mostly, with minor deviations
+3=matches partially, with clear gaps
+2=largely fails to match
+1=fails to match entirely
+
+Then output ONLY a JSON object with exactly one key: SA.
+
+Example:
+{{"SA": 3}}""",
         ],
     },
     "PTV": {
@@ -394,11 +501,116 @@ Then output ONLY a JSON object with exactly one key: PTV.
 Example:
 {{"PTV": 4}}""",
         "paraphrases": [
-            "",
-            "",
-            "",
-            "",
-            "",
+            """\
+Assess Temporal Coherence (PTV) in this video.
+
+Caption:
+"{prompt}"
+
+This clip comes from a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt above.
+
+Before scoring, think through these sub-questions:
+{questions_block}
+
+Score on a 1-5 scale:
+5=events unfold in a fully plausible order
+4=mostly plausible, with minor timing issues
+3=only partially plausible
+2=mostly implausible
+1=the event order is completely implausible
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
+            """\
+Rate Temporal Coherence (PTV) for the video.
+
+Caption:
+"{prompt}"
+
+The video was produced by a text+image-to-video (ti2v) model conditioned on the first frame together with the caption above.
+
+Consider these sub-questions before assigning a score:
+{questions_block}
+
+Use a 1-5 scale:
+5=event order is fully believable
+4=mostly believable, small timing hiccups
+3=believable in parts only
+2=mostly unbelievable
+1=event order makes no sense at all
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
+            """\
+Judge how temporally coherent (PTV) this video is.
+
+Caption:
+"{prompt}"
+
+This is the output of a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt shown above.
+
+Work through these sub-questions in your mind before scoring:
+{questions_block}
+
+Give a score of 1-5, where:
+5=the sequence of events is fully plausible
+4=mostly plausible, minor timing problems
+3=plausible in some respects only
+2=mostly implausible
+1=the sequence of events is entirely implausible
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
+            """\
+Score Temporal Coherence (PTV): does the order of events make sense?
+
+Caption:
+"{prompt}"
+
+The video was generated by a text+image-to-video (ti2v) model conditioned on the first frame plus the text prompt above.
+
+Sub-questions to work through mentally before scoring:
+{questions_block}
+
+Rate it 1-5:
+5=fully plausible sequencing
+4=mostly plausible, minor timing issues
+3=partially plausible sequencing
+2=mostly implausible sequencing
+1=implausible sequencing throughout
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
+            """\
+Determine the Temporal Coherence (PTV) score for this video.
+
+Caption:
+"{prompt}"
+
+This video was made by a text+image-to-video (ti2v) model, conditioned on the first frame together with the caption above.
+
+Before you score, run through these sub-questions:
+{questions_block}
+
+Score from 1-5:
+5=event timing and order are fully plausible
+4=mostly plausible, with minor timing slips
+3=plausible only in part
+2=largely implausible
+1=not plausible at all
+
+Then output ONLY a JSON object with exactly one key: PTV.
+
+Example:
+{{"PTV": 4}}""",
         ],
     },
     "persistence": {
@@ -425,11 +637,116 @@ Then output ONLY a JSON object with exactly one key: persistence.
 Example:
 {{"persistence": 4}}""",
         "paraphrases": [
-            "",
-            "",
-            "",
-            "",
-            "",
+            """\
+Assess Object Persistence in this video.
+
+Caption, for context only:
+"{prompt}"
+
+This clip comes from a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt above.
+
+Before scoring, think through these sub-questions:
+{questions_block}
+
+Score on a 1-5 scale:
+5=objects stay fully consistent throughout
+4=mostly consistent, with minor flicker
+3=some noticeable issues
+2=major inconsistencies appear
+1=objects severely disappear or change identity
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
+            """\
+Rate how well objects persist across the video.
+
+Caption, for context only:
+"{prompt}"
+
+The video was produced by a text+image-to-video (ti2v) model conditioned on the first frame together with the caption above.
+
+Consider these sub-questions before assigning a score:
+{questions_block}
+
+Use a 1-5 scale:
+5=complete object consistency
+4=mostly consistent, slight flicker only
+3=issues are noticeable
+2=inconsistencies are major
+1=objects disappear or change identity severely
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
+            """\
+Judge the Object Persistence shown in this video.
+
+Caption, for context only:
+"{prompt}"
+
+This is the output of a text+image-to-video (ti2v) model, conditioned on the first frame and the text prompt shown above.
+
+Work through these sub-questions in your mind before scoring:
+{questions_block}
+
+Give a score of 1-5, where:
+5=objects remain fully consistent
+4=mostly consistent, with minor flickering
+3=there are noticeable problems
+2=inconsistencies are significant
+1=objects vanish or change identity severely
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
+            """\
+Score Object Persistence: do objects stay the same across the video?
+
+Caption, for context only:
+"{prompt}"
+
+The video was generated by a text+image-to-video (ti2v) model conditioned on the first frame plus the text prompt above.
+
+Sub-questions to work through mentally before scoring:
+{questions_block}
+
+Rate it 1-5:
+5=fully consistent objects throughout
+4=mostly consistent, minor flicker present
+3=some clear inconsistencies
+2=major inconsistencies present
+1=severe disappearance or identity swaps
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
+            """\
+Determine the Object Persistence score for this video.
+
+Caption, for context only:
+"{prompt}"
+
+This video was made by a text+image-to-video (ti2v) model, conditioned on the first frame together with the caption above.
+
+Before you score, run through these sub-questions:
+{questions_block}
+
+Score from 1-5:
+5=objects are fully consistent
+4=mostly consistent, only slight flicker
+3=noticeable consistency issues
+2=inconsistencies are major
+1=objects severely disappear or change identity
+
+Then output ONLY a JSON object with exactly one key: persistence.
+
+Example:
+{{"persistence": 4}}""",
         ],
     },
     # shared by all 13 laws: gravity, inertia, momentum, impenetrability,
@@ -462,11 +779,131 @@ Then output ONLY a JSON object with exactly one key: {law}.
 Example:
 {{"{law}": 3}}""",
         "paraphrases": [
-            "",
-            "",
-            "",
-            "",
-            "",
+            """\
+Judge physical realism for a single physical law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, for context only:
+"{prompt}"
+
+Sub-questions to think through before you score:
+{questions_block}
+
+Base your judgment on the video itself. Only penalize a mismatch with the caption if it affects whether this physical law can be evaluated at all.
+
+Score on a 1-5 scale:
+5=clearly correct
+4=mostly correct, minor issues only
+3=partially correct or unclear
+2=mostly incorrect
+1=severely incorrect
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
+            """\
+Assess how physically realistic the video is with respect to one law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, shown only for context:
+"{prompt}"
+
+Before scoring, consider these sub-questions:
+{questions_block}
+
+Evaluate the video itself, not the caption. Only dock points for a prompt mismatch if it prevents you from judging this physical law.
+
+Score 1-5:
+5=fully correct
+4=mostly correct with small problems
+3=correct in part, or ambiguous
+2=largely incorrect
+1=severely wrong
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
+            """\
+Rate the video's physical realism for a single law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, included only for context:
+"{prompt}"
+
+Work through these sub-questions before scoring:
+{questions_block}
+
+Score what you see in the video. A mismatch with the caption should only lower the score if it stops you from judging this physical law.
+
+Give a score of 1-5, where:
+5=clearly accurate
+4=mostly accurate, minor flaws
+3=partly accurate or hard to tell
+2=mostly inaccurate
+1=badly inaccurate
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
+            """\
+Determine whether the video obeys this physical law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, for context only:
+"{prompt}"
+
+Sub-questions to run through mentally before you score:
+{questions_block}
+
+Base the score on the video, not the caption. Penalize a caption mismatch only when it makes this physical law impossible to judge.
+
+Rate it 1-5:
+5=entirely correct
+4=mostly correct, small issues
+3=partly correct or ambiguous
+2=mostly wrong
+1=badly wrong
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
+            """\
+Score physical realism for this single law: {law}.
+
+Criterion:
+{criteria}
+
+Caption, for context only:
+"{prompt}"
+
+Before assigning a score, think through these sub-questions:
+{questions_block}
+
+Judge the video on its own merits. Only let a prompt mismatch affect the score if it makes this physical law unjudgeable.
+
+Score from 1-5:
+5=clearly right
+4=mostly right, minor issues
+3=partially right or unclear
+2=mostly not right
+1=severely not right
+
+Then output ONLY a JSON object with exactly one key: {law}.
+
+Example:
+{{"{law}": 3}}""",
         ],
     },
 }
