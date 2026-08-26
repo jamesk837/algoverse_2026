@@ -274,6 +274,46 @@ _P2_VP2_RE = re.compile(
     r"\b(" + "|".join(sorted(VP2_NUM_MAP, key=len, reverse=True)) + r")\b",
     re.IGNORECASE)
 
+
+# ------------------------------------------------ vp2 rationale elicitation --
+# videophy_2_auto is two fine-tunes downstream of VideoCon (HF model tree:
+# videophy_2_auto <- videocon_physics <- VideoCon on mPLUG-Owl-video), and
+# VideoCon's third training task was natural-language explanation:
+#   "[V] What is the misalignment between this video and the description [C]?"
+# videophy_2_auto's OWN SFT also included a per-rule 0/1/2 task the harness
+# never wired in (upstream VIDEOPHY2/template.py, PROMPT_RULE, quoted verbatim
+# below). Both are TRAINED interfaces -- vp2_rationale_probe tries those before
+# any free-form ask, because format-matching a trained task is what makes a
+# non-digit answer reachable at all on a model whose score template collapsed
+# to digit->EOS.
+VP2_PREAMBLE = (
+    "The following is a conversation between a curious human and an AI assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+)
+VP2_PROMPT_NLE = (
+    VP2_PREAMBLE +
+    "Human: <|video|>\n"
+    "Human: What is the misalignment between this video and the description: \"{caption}\"?\n"
+    "AI: "
+)
+# verbatim from upstream VIDEOPHY2/template.py (including the stray space
+# before the final newline)
+VP2_PROMPT_RULE = (
+    VP2_PREAMBLE +
+    "Human: <|video|>\n"
+    "Human: Does the video follow the physical rule: \"{rule}\"?\n"
+    "Choose 0 if not, 1 if valid, or 2 if indeterminate. \n"
+    "AI: "
+)
+# generic probes only; production should feed each clip's own candidate rules
+# from the VideoPhy-2 metadata
+VP2_PROBE_RULES = (
+    "Objects fall under gravity unless supported",
+    "Solid objects do not pass through each other",
+    "Object motion is smooth and continuous over time",
+)
+VP2_EXPLAIN_TURN = "Explain why you gave that rating. What in the video did you rely on?"
+
 WMB_COT = False
 
 def _wmb_template(text):
@@ -923,6 +963,114 @@ JUDGES = {
     "videophy2_auto": VideoPhy2AutoJudge,
     "phyjudge_9b": PhyJudge9BJudge,
 }
+
+def vp2_rationale_probe(dataset="test", n_clips=3, push_to_s3=True):
+    """Elicitation ladder for a videophy2_auto score rationale, on clean clips
+    that already have a pass-1 PC score.
+
+    Every mode ECHOES the exact text handed to the processor and stores it in
+    the report, so "was the follow-up actually in the prompt" is answered by
+    the artifact. Modes, strongest first methodologically:
+
+      rule_*         the model's OWN trained 0/1/2 per-rule task (native SFT)
+      nle            VideoCon's trained explanation task, trained wording
+      explain        the two-turn follow-up (VP2_PASS2_MODE="two_turn" path,
+                     second phrasing)
+      explain_wrong  same transcript with a deliberately WRONG digit planted:
+                     reply echoes the plant -> turn 2 copies the transcript;
+                     reply is the true pass-1 digit -> it recomputes from the
+                     video and ignores the conversation
+      explain_forced explain with EOS banned for 40 tokens  (diagnostic only)
+      prefill        forced opener "I rated it N because"   (diagnostic only)
+      describe       capability floor: ANY prose in-template at all?
+
+    Reads pass-1 from RESULT_PREFIX explicitly -- result_key() follows the
+    PASS2/PARAPHRASE globals and must not be used to reach pass-1 records.
+    """
+    judge = VideoPhy2AutoJudge()
+    judge.load()
+    torch = judge.torch
+
+    def generate(text, video_path, min_new=None):
+        kwargs = {k: v for k, v in VP2_GENERATE_KWARGS.items()
+                  if k != "max_length"}
+        kwargs["max_new_tokens"] = 256
+        if min_new:
+            kwargs["min_new_tokens"] = min_new
+        inputs = judge.processor(text=[text], videos=[str(video_path)],
+                                 num_frames=judge.num_frames,
+                                 return_tensors="pt")
+        inputs = {k: (v.bfloat16() if v.dtype == torch.float else v)
+                  for k, v in inputs.items()}
+        inputs = {k: v.to(judge.model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            res = judge.model.generate(**inputs, **kwargs)
+        return judge.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
+
+    captions = build_caption_manifest(dataset)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    report, done = [], 0
+
+    for source_key in list_source_videos(dataset, limit=max(n_clips * 4, 12)):
+        if done >= n_clips:
+            break
+        stem = Path(source_key).stem
+        caption = lookup_caption(dataset, captions, source_key)
+        rec = get_json(f"{RESULT_PREFIX}/{judge.name}/{dataset}/{stem}.json")
+        call = ((rec or {}).get("runs", {}).get("clean", {})
+                .get("calls", {}).get("PC", {}))
+        raw1, score1 = call.get("raw"), call.get("parsed")
+        if caption is None or score1 is None:
+            print(f"skip {stem[:44]}: no caption or no pass-1 clean PC score")
+            continue
+
+        # splice what the model actually said in pass 1; fall back to the
+        # parsed digit if the raw reply is unexpectedly long
+        splice = raw1.strip() if raw1 and len(raw1.strip()) <= 8 else str(score1)
+        wrong = "1" if splice != "1" else "5"
+        transcript = PROMPT_PHYSICS + splice + "\n"
+        followup = transcript + "Human: " + VP2_EXPLAIN_TURN + "\nAI: "
+        followup_wrong = (PROMPT_PHYSICS + wrong + "\nHuman: "
+                          + VP2_EXPLAIN_TURN + "\nAI: ")
+
+        modes = [
+            ("nle", VP2_PROMPT_NLE.format(caption=caption), None),
+            ("explain", followup, None),
+            ("explain_wrong", followup_wrong, None),
+            ("explain_forced", followup, 40),
+            ("prefill", followup + "I rated it %s because" % splice, None),
+            ("describe", VP2_PREAMBLE + "Human: <|video|>\n"
+             "Human: Describe what happens in the video.\nAI: ", None),
+        ] + [
+            ("rule_%d" % i, VP2_PROMPT_RULE.format(rule=r), None)
+            for i, r in enumerate(VP2_PROBE_RULES)
+        ]
+
+        local = TMP_DIR / f"probe__{safe_local_name(Path(source_key).name)}"
+        s3.download_file(BUCKET, source_key, str(local))
+        print("\n" + "=" * 72)
+        print(f"{stem}\n  caption: {caption[:80]}\n  pass-1 PC: {raw1!r} -> "
+              f"{score1}   (wrong-digit plant: {wrong})")
+        entry = {"stem": stem, "caption": caption, "pass1_raw": raw1,
+                 "pass1_pc": score1, "wrong_plant": wrong, "modes": {}}
+        try:
+            for name, text, min_new in modes:
+                if done == 0:
+                    print(f"\n--- {name}: exact prompt ---\n{text!r}")
+                out = generate(text, local, min_new)
+                entry["modes"][name] = {"prompt": text, "raw": out}
+                print(f"  {name:15s} len {len(out):4d}  {out[:100]!r}")
+        finally:
+            local.unlink(missing_ok=True)
+        report.append(entry)
+        done += 1
+
+    if push_to_s3 and report:
+        key = f"{PASS2_RESULT_PREFIX}/videophy2_auto/_rationale_probe.json"
+        put_json(key, {"dataset": dataset, "clips": report})
+        print(f"\nprobe -> s3://{BUCKET}/{key}")
+    return report
+
 
 def video_key_for(dataset, source_key, variant):
     if variant == "clean":
