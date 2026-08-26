@@ -100,6 +100,30 @@ PASS2_REWRITES = {
 PHYJUDGE_P2_SENTENCE_OLD = "Then output ONLY a JSON object with exactly one key: %s."
 PHYJUDGE_P2_SENTENCE_NEW = "Then output a JSON object with exactly two keys: %s and reason."
 PHYJUDGE_P2_REASON = '"<why you gave this score>"'
+# videophy2_auto is fine-tuned to emit a score digit and end the turn, so a
+# rationale request inside the same turn is ignored (measured 2026-08-26: every
+# reply is one character). Its prompt is already a Human:/AI: transcript, so the
+# alternative is a real second turn:
+#
+#   turn 1  the pass-1 prompt, verbatim -> the score digit
+#   turn 2  that transcript with the digit filled in after "AI: ", a new Human:
+#           turn asking why, and a fresh "AI: " for the model to complete
+#
+# The turn-1 digit is NOT regenerated -- it is read from results/pass1, so the
+# pass-2 score is the pass-1 score by construction. Consequence worth stating
+# when reporting: for this judge the two passes cannot measure whether requiring
+# a justification moves the score, because it cannot. What they compare is the
+# rationale against a score that is held fixed.
+#
+# MEASURED, 3 clips x SA and PC: turn 2 returns ONE character, echoing the digit
+# that was planted rather than answering the new Human turn. Kept in the tree
+# because it is the mode that was asked for and the negative result is the
+# finding. "suffix" reproduces the earlier single-turn behaviour, which fails
+# differently -- the suffix is ignored and the reply is the bare digit.
+VP2_PASS2_MODE = "two_turn"          # "two_turn" | "suffix"
+VP2_TWO_TURN_ASK = (
+    "Why did you give that rating? Explain how and why you arrived at it."
+)
 VP2_RATIONALE_SUFFIX = (
     " Give the rating first, then a short explanation of why and how you "
     "arrived at it."
@@ -706,15 +730,58 @@ class VideoPhy2AutoJudge:
                     "paraphrase: videophy2 %s instruction not found in the "
                     "prompt; paraphrases.py has drifted" % call_id)
             base = base.replace(old, new, 1)
-        if not self.pass2:
+        if not self.pass2 or VP2_PASS2_MODE == "two_turn":
+            # under two_turn this IS turn 1, byte-identical to pass 1;
+            # run() appends the second turn
             return base
         # the trailing "AI: " must stay last -- the model completes it
         head, sep, tail = base.rpartition("\nAI: ")
         return head + VP2_RATIONALE_SUFFIX + sep + tail
 
+    def set_context(self, dataset, source_key, variant):
+        """Told which (clip, variant) is being scored, so two_turn can find the
+        pass-1 digit. process_clip calls this if the judge defines it."""
+        self._ctx = (dataset, source_key, variant)
+
+    def pass1_score(self, call_id):
+        """The pass-1 digit for the current (clip, variant, call), read from S3.
+
+        Raises rather than regenerating: a silent fallback would make the pass-2
+        score sometimes inherited and sometimes freshly generated, with nothing
+        in the record saying which.
+        """
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "videophy2 two_turn needs set_context(dataset, source_key, "
+                "variant) before run()")
+        dataset, source_key, variant = ctx
+        key = "%s/%s/%s/%s.json" % (RESULT_PREFIX, self.name, dataset,
+                                    Path(source_key).stem)
+        cached = getattr(self, "_p1_cache", None)
+        if not cached or cached[0] != key:
+            self._p1_cache = (key, get_json(key))
+        rec = self._p1_cache[1]
+        if not rec:
+            raise RuntimeError(
+                "videophy2 two_turn: no pass-1 record at s3://%s/%s -- score "
+                "pass 1 for this clip first" % (BUCKET, key))
+        call = rec.get("runs", {}).get(variant, {}).get("calls", {}).get(call_id)
+        if not call or call.get("parsed") is None:
+            raise RuntimeError(
+                "videophy2 two_turn: pass 1 has no parsed score for %s/%s in %s"
+                % (variant, call_id, key))
+        return call["parsed"]
+
     def run(self, video_path, caption, call_id):
         torch = self.torch
-        prompts = [self.build_prompt(call_id, caption)]
+        prompt = self.build_prompt(call_id, caption)
+        score = None
+        if self.pass2 and VP2_PASS2_MODE == "two_turn":
+            score = self.pass1_score(call_id)
+            prompt = "%s%s\nHuman: %s\nAI: " % (
+                prompt, score, VP2_TWO_TURN_ASK)
+        prompts = [prompt]
         inputs = self.processor(text=prompts, videos=[str(video_path)],
                                 num_frames=self.num_frames, return_tensors="pt")
         inputs = {k: v.bfloat16() if v.dtype == torch.float else v
@@ -726,6 +793,10 @@ class VideoPhy2AutoJudge:
             res = self.model.generate(**inputs, **kwargs)
         output = self.tokenizer.decode(res.tolist()[0], skip_special_tokens=True)
         if self.pass2:
+            if VP2_PASS2_MODE == "two_turn":
+                # the score is pass 1's and is NOT re-parsed out of turn 2 --
+                # turn 2 is the rationale, and any number in it is prose
+                return output, score
             # positional, same vocabulary as pass 1: vp2_parse walks the map in
             # dict order, so "there is one ball" would beat a leading "3"
             m = _P2_VP2_RE.search(output or "")
@@ -954,6 +1025,9 @@ def process_clip(judge, dataset, source_key, caption, items, push_to_s3):
         try:
             run = record["runs"].setdefault(
                 variant, {"video_key": video_key, "caption": caption, "calls": {}})
+            setter = getattr(judge, "set_context", None)
+            if setter is not None:
+                setter(dataset, source_key, variant)
             for call_id in call_ids:
                 calls_run += 1
                 try:
