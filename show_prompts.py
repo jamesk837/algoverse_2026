@@ -40,7 +40,8 @@ for cid in a.call_ids():
     show("%s   PASS 2" % cid, p2)
     added = p2.replace(p1, "")
     print("\n   >>> pass 2 adds exactly: %r" % added)
-    break   # the rest differ only in the question; drop this to see all 8
+print("\n   all %d vila calls get the same sentence appended, once each"
+      % len(a.call_ids()))
 
 # ----------------------------------------------------------- videophy2 -----
 print("\n" + BAR)
