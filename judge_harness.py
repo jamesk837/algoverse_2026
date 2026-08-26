@@ -52,8 +52,8 @@ PASS2 = False  # set by run_judges(pass2=...); read by result_key()
 # reasoning first would change the score, which is exactly what pass 2 exists
 # to measure and must therefore not do to itself.
 RATIONALE_REQUEST = (
-    " Give your answer first, exactly in the format requested above, then on "
-    "the next line explain why and how you arrived at it."
+    " Be as objective as possible. After giving your answer, provide a short "
+    "explanation of why and how you arrived at it."
 )
 
 # Pass 1's parsers read the whole reply, so they cannot survive a rationale
