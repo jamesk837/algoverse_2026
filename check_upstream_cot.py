@@ -34,6 +34,49 @@ from pathlib import Path
 
 import judge_harness as J
 
+UPSTREAM_SOURCE = ("https://raw.githubusercontent.com/WorldModelBench-Team/"
+                   "WorldModelBench/main/evaluation.py")
+# Pasted verbatim from that file, 2026-08-26. Two lines inside the criteria
+# block carry 12 spaces of TRAILING whitespace -- that is upstream's, and an
+# editor that strips it changes the prompt. Compared byte-for-byte below so
+# "the prompts match upstream" is an assertion this file makes, not a claim a
+# doc repeats.
+UPSTREAM_TEMPLATES = {
+    "instruction": """
+            Evaluate if this video follows the instruction: '{instruction}'.
+            Use the following scoring criteria:
+            
+            - 0: The video does not follow the instruction at all.
+            - 1: The video includes the correct object but performs the wrong action, or vice versa.
+            - 2: The video follows the instruction and shows a tendency toward the intended goal.
+            - 3: The video follows the instruction precisely and successfully achieves the goal.
+            
+            Let's analyze step-by-step and conclude with 'Score: [score]'.
+        """.strip(),
+    "physical_laws": """
+            Watch the video and determine if it shows any '{physical_laws}'
+            Let's think step-by-step and conclude with "Yes" or "No".
+        """.strip(),
+    "common_sense": """
+            Does the video exhibit '{common_sense}'?
+            Let's think step-by-step and conclude with "Yes" or "No".
+        """.strip(),
+}
+UPSTREAM_QUESTIONS = {
+    "instruction": None,
+    "physical_laws": [
+        "Violation of Newton's Law: Objects move without any external force.",
+        "Violation of the Law of Conservation of Mass or Solid Constitutive Law: Objects deform irregularly.",
+        "Violation of Fluid Constitutive Law: Liquids flow in an unnatural manner.",
+        "Violation of Non-physical Penetration: Objects unnaturally pass through each other.",
+        "Violation of Gravity: Objects behave inconsistently with gravity.",
+    ],
+    "common_sense": [
+        "Poor Aesthetics: Visually unappealing or low-quality content.",
+        "Temporal Inconsistency: Noticeable flickering or abrupt changes.",
+    ],
+}
+
 COT_STEMS = {
     "instruction": "Let's analyze step-by-step and conclude with",
     "physical_laws": "Let's think step-by-step and conclude with",
@@ -93,7 +136,17 @@ def verify(caption="a ball rolls off a table and falls to the floor"):
             problems.append("%s: %d continuation line(s) lost the 12-space "
                             "indent" % (call_id, len(bad)))
 
-    print("checked %d calls against the raw templates" % len(cot.call_ids()))
+    for k, want in UPSTREAM_TEMPLATES.items():
+        if J.WMB_PROMPT_TEMPLATES.get(k) != want:
+            problems.append("template %r has DRIFTED from %s" % (k, UPSTREAM_SOURCE))
+    for k, want in UPSTREAM_QUESTIONS.items():
+        if J.WMB_QUESTION_POOL.get(k) != want:
+            problems.append("question pool %r has DRIFTED from %s"
+                            % (k, UPSTREAM_SOURCE))
+
+    print("checked %d calls against the raw templates, and %d templates / %d "
+          "question groups against upstream source"
+          % (len(cot.call_ids()), len(UPSTREAM_TEMPLATES), len(UPSTREAM_QUESTIONS)))
     if problems:
         print("\n%d PROBLEM(S):" % len(problems))
         for p in problems:
