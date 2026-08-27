@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
@@ -448,6 +449,88 @@ def clips_with_attacks(dataset):
             if stem:
                 stems.add(stem)
     return stems
+
+
+def clips_with_variants(dataset, variants):
+    """Stems that have EVERY requested attacked variant actually rendered.
+
+    clips_with_attacks() answers a cheaper question -- does the clip have a
+    variant directory at all -- using Delimiter="/" so one LIST returns a
+    common prefix per clip instead of an object per variant. That is the right
+    trade when the run wants all nine, because a clip with a directory almost
+    always has the full set and a stray gap costs one `missing video` line.
+
+    It is the wrong trade when the run wants a NAMED subset: a clip whose
+    directory holds eight variants but not `shuffle` passes that check, gets
+    counted against num_clips, and then contributes a clean score with nothing
+    to difference it against. Every measurement here is a within-clip delta, so
+    that clip is not a partial result, it is no result. This does the full
+    object LIST -- ~9 keys per clip, still one paginated call -- and requires
+    each named variant to be present.
+    """
+    want = {v for v in variants if v != "clean"}   # clean IS the source object
+    if not want:
+        return None                                # nothing to require
+    prefix = f"attacks/{dataset}/"
+    have, paginator = {}, s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rest = obj["Key"][len(prefix):]
+            stem, _, name = rest.rpartition("/")
+            if stem and name.endswith(".mp4"):
+                have.setdefault(stem, set()).add(name[:-len(".mp4")])
+    return {stem for stem, got in have.items() if want <= got}
+
+
+def clips_with_pass1(dataset, model, call_ids, variants, stems, workers=8):
+    """Stems whose results/pass1 record for `model` is complete over the
+    requested variants -- every call present, on every variant.
+
+    Existence of the result object is not the same question. Checkpointing is
+    per (clip, variant, call), so a record appears at a clip's FIRST variant
+    and an interrupted run leaves a partial one behind; a LIST would count
+    those as scored. Pass 2 exists to be differenced against pass 1, so a clip
+    whose pass-1 side is half-written yields a comparison with a hole in it.
+
+    Reads only the candidate stems, in parallel -- the module client is
+    thread-safe (it is fork-safety boto3 lacks) and botocore pools 10
+    connections by default, so the worker count stays under that.
+    """
+    keys = {stem: f"{RESULT_PREFIX}/{model}/{dataset}/{stem}.json"
+            for stem in stems}
+
+    def fetch(stem):
+        return stem, get_json(keys[stem])
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        records = dict(pool.map(fetch, sorted(stems)))
+
+    complete, absent, partial, unparsed = set(), [], [], []
+    for stem, rec in records.items():
+        if not rec:
+            absent.append(stem)
+            continue
+        runs = rec.get("runs", {})
+        gaps = [v for v in variants
+                if any(c not in runs.get(v, {}).get("calls", {})
+                       for c in call_ids)]
+        if gaps:
+            partial.append(stem)
+            continue
+        complete.add(stem)
+        if any(out.get("parsed") is None
+               for v in variants for out in runs[v]["calls"].values()):
+            unparsed.append(stem)
+
+    print(f"  pass-1 {model}: {len(complete)} of {len(stems)} clips complete "
+          f"over {'+'.join(variants)} ({len(absent)} never scored, "
+          f"{len(partial)} partial)")
+    if unparsed:
+        # kept, not dropped: an unparsed call is already visible in the
+        # record's `unparsed` list, and silently shrinking n would be worse
+        print(f"  NOTE {len(unparsed)} of those carry at least one unparsed "
+              f"pass-1 call; they are kept -- check record['unparsed']")
+    return complete
 
 
 def shard_keys(keys, shard):
@@ -1127,10 +1210,18 @@ def result_key(model, dataset, source_key):
     return f"{prefix}/{model}/{dataset}/{Path(source_key).stem}.json"
 
 
-def missing_items(record, call_ids):
+def missing_items(record, call_ids, variants=None):
+    """Outstanding (variant, [call_id]) pairs. `variants` narrows the run to a
+    named subset; None means all of VARIANTS.
+
+    Narrowing changes what "already complete" means -- a clip with clean and
+    shuffle done counts as finished even though seven variants were never
+    touched. That is intended for a subset run, and it is also why the subset
+    belongs in the caller's command rather than in a default.
+    """
     runs = record.get("runs", {}) if record else {}
     missing = []
-    for variant in VARIANTS:
+    for variant in (variants or VARIANTS):
         done = runs.get(variant, {}).get("calls", {})
         todo = [c for c in call_ids if c not in done]
         if todo:
@@ -1235,8 +1326,21 @@ def show_results(df):
 
 def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                rebuild_captions=False, show=None, shard=None,
-               require_attacks=True, pass2=False, paraphrase=None):
+               require_attacks=True, pass2=False, paraphrase=None,
+               variants=None, require_pass1=None):
     """pass2=True asks each judge to score AND justify, in one generation.
+
+    `variants` narrows the run to a named subset of VARIANTS (e.g.
+    ("clean", "shuffle")); None runs all ten. A subset also tightens
+    require_attacks, which otherwise only checks that a variant DIRECTORY
+    exists -- see clips_with_variants.
+
+    `require_pass1` is a judge name: only clips whose results/pass1 record for
+    that judge is complete over the requested variants are eligible. Pass 2 is
+    only ever read as a difference against pass 1, so a clip with no pass-1
+    side to difference against is 32 phyjudge generations bought for nothing.
+    Both filters run BEFORE the num_clips limit and the shard, so num_clips
+    keeps counting clips that can actually produce a comparison.
 
     Pass 2 is score + rationale, NOT chain-of-thought. Each judge gets its own
     pass-1 prompt with its FORMAT INSTRUCTION rewritten to ask for the answer
@@ -1260,6 +1364,19 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
         raise ValueError(f"dataset must be one of {list(DATASETS)}")
     models = models or list(JUDGES)
     show = (not push_to_s3) if show is None else show
+
+    if variants is not None:
+        variants = list(variants)
+        unknown = [v for v in variants if v not in VARIANTS]
+        if unknown:
+            raise ValueError(f"unknown variant(s) {unknown}; "
+                             f"expected a subset of {VARIANTS}")
+        if not variants:
+            raise ValueError("variants is empty; omit it to run all of VARIANTS")
+        print(f"variants: {', '.join(variants)} "
+              f"({len(VARIANTS) - len(variants)} of {len(VARIANTS)} skipped)")
+    if require_pass1 is not None and require_pass1 not in JUDGES:
+        raise ValueError(f"require_pass1 must be one of {list(JUDGES)}")
 
     if paraphrase is not None:
         if pass2:
@@ -1294,15 +1411,39 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     # Filter BEFORE the num_clips limit, so num_clips counts clips that can
     # actually be scored rather than positions in the raw listing.
     if require_attacks:
-        have = clips_with_attacks(dataset)
+        # a named subset needs those exact renders, not just a directory
+        have = (clips_with_attacks(dataset) if variants is None
+                else clips_with_variants(dataset, variants))
         before = len(source_keys)
-        source_keys = [k for k in source_keys if Path(k).stem in have]
-        print(f"{len(source_keys)} of {before} source clips have rendered attacks"
+        if have is not None:
+            source_keys = [k for k in source_keys if Path(k).stem in have]
+        want = "rendered attacks" if variants is None else \
+            "every requested variant rendered"
+        print(f"{len(source_keys)} of {before} source clips have {want}"
               f" ({before - len(source_keys)} skipped;"
               f" pass require_attacks=False to score them clean-only)")
         if not source_keys:
             print(f"nothing under attacks/{dataset}/ - run attack_suite first")
             return results_frame([])
+
+    if require_pass1 is not None:
+        # call_ids() is static on all three judges -- no weights load here
+        need = JUDGES[require_pass1]().call_ids()
+        scored = clips_with_pass1(dataset, require_pass1, need,
+                                  variants or VARIANTS,
+                                  [Path(k).stem for k in source_keys])
+        before = len(source_keys)
+        source_keys = [k for k in source_keys if Path(k).stem in scored]
+        print(f"{len(source_keys)} of {before} clips kept "
+              f"(complete pass-1 {require_pass1} record)")
+        if not source_keys:
+            print(f"no clip has a complete pass-1 record for {require_pass1} "
+                  f"- run pass 1 on this dataset first")
+            return results_frame([])
+
+    if num_clips and len(source_keys) < num_clips:
+        print(f"WARNING only {len(source_keys)} eligible clips, fewer than the "
+              f"{num_clips} asked for; running all of them")
     source_keys = source_keys[:num_clips] if num_clips else source_keys
     # After the limit, never before: the stripes then cover exactly the clips a
     # single unsharded run of the same num_clips would have taken.
@@ -1329,7 +1470,7 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
                 print(f"  no caption for {source_key}, skipping")
                 continue
             existing = get_json(result_key(judge.name, dataset, source_key))
-            missing = missing_items(existing, call_ids)
+            missing = missing_items(existing, call_ids, variants)
             if missing:
                 todo.append((source_key, caption, missing))
             else:
