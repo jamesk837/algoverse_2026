@@ -52,6 +52,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+from botocore.config import Config
 
 # Colab hands credentials through userdata; everywhere else boto3's ambient
 # chain does. Every read is optional -- the import succeeding does not mean
@@ -71,7 +72,16 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 BUCKET = "nickb-aarj"
 RESULT_ROOT = "results/"
-s3 = boto3.client("s3")
+
+# Records are read READ_WORKERS at a time and botocore pools 10 connections by
+# default, so the pool is the bottleneck and urllib3 logs a "Connection pool is
+# full, discarding connection" line per eviction -- thousands of them, and each
+# discarded connection is a TCP+TLS handshake paid again. Same fix as
+# embed_vjepa._ensure_s3.
+READ_WORKERS = 32
+s3 = boto3.client("s3", config=Config(
+    max_pool_connections=READ_WORKERS + 8,
+    retries={"max_attempts": 5, "mode": "standard"}))
 
 # from judge_harness.ATTACK_FILES, with clean prepended
 VARIANTS = [
@@ -97,6 +107,17 @@ CALLS = {
 }
 
 DATASETS = ["test", "implausibench_real", "implausibench_implausible"]
+
+# Pass 2 is phyjudge only, and that is a decision rather than a state of the
+# data: vila cannot produce a rationale at all (four prompt rewrites and
+# min_new_tokens were tested and failed) and videophy2 is not being run. Stray
+# records DO exist under results/pass2/vila_ewm/ and results/pass2/
+# videophy2_auto/ from the early attempts, and auditing them reports 449
+# "eligible clips never scored" for a run nobody intends to finish. Any prefix
+# starting with this one is restricted to PASS2_JUDGES -- results/pass2 and
+# results/pass2_captions both.
+PASS2_PREFIX = "results/pass2"
+PASS2_JUDGES = ["phyjudge_9b"]
 
 # A parsed 0 is a real score only for vila's instruction call, which is 0-3.
 # VideoPhy-2 SA/PC and phyjudge are 1-5, so a 0 there is upstream's
@@ -197,7 +218,7 @@ def _expected_variants(records, subset_threshold=0.5):
     return inferred, seen, is_subset
 
 
-def audit_cell(prefix, judge, dataset, rendered, top=3):
+def audit_cell(prefix, judge, dataset, rendered, top=3, raw_chars=200):
     """One (prefix, judge, dataset). Prints its block, returns problem strings."""
     call_ids = CALLS[judge]
     keys, _ = _list(f"{prefix}/{judge}/{dataset}/")
@@ -205,7 +226,7 @@ def audit_cell(prefix, judge, dataset, rendered, top=3):
     if not keys:
         return []
 
-    with ThreadPoolExecutor(32) as ex:
+    with ThreadPoolExecutor(READ_WORKERS) as ex:
         records = [r for r in ex.map(_get, keys) if r]
 
     variants, seen, is_subset = _expected_variants(records)
@@ -218,7 +239,10 @@ def audit_cell(prefix, judge, dataset, rendered, top=3):
     examples = defaultdict(list)
     complete = attempted = 0
     unparsed = zeros = empty = 0
-    rawlens = []
+    unparsed_call = Counter()
+    unparsed_variant = Counter()
+    unparsed_rows = []          # (clip, variant, call, raw) -- the raw is the
+    rawlens = []                # only thing that says WHY it did not parse
 
     for rec in records:
         stem = rec.get("clip", rec.get("source_key", "?"))
@@ -241,6 +265,9 @@ def audit_cell(prefix, judge, dataset, rendered, top=3):
                     parsed, raw = out.get("parsed"), out.get("raw")
                     if parsed is None:
                         unparsed += 1
+                        unparsed_call[c] += 1
+                        unparsed_variant[v] += 1
+                        unparsed_rows.append((stem, v, c, raw))
                     elif (isinstance(parsed, (int, float))
                           and not isinstance(parsed, bool)
                           and parsed == 0 and (judge, c) not in ZERO_OK):
@@ -295,7 +322,26 @@ def audit_cell(prefix, judge, dataset, rendered, top=3):
         for stem, v, c in examples[cause]:
             print(f"   {'':<15} e.g. {stem[:52]}  {v}/{c}")
 
-    if rawlens and prefix.endswith("pass2"):
+    if unparsed_rows:
+        # An unparsed call is a stored score of None -- the record's own
+        # `unparsed` list already names it, but not what the model actually
+        # said, which is the only thing that distinguishes a truncated reply
+        # from a refusal from a parser that needs widening.
+        cs = ", ".join(f"{c}({n})" for c, n in unparsed_call.most_common(6))
+        vs = ", ".join(f"{v}({n})" for v, n in unparsed_variant.most_common(6))
+        print(f"   unparsed by call:    {cs}")
+        print(f"   unparsed by variant: {vs}")
+        for stem, v, c, raw in unparsed_rows[:max(top, 5)]:
+            text = " ".join((raw or "").split())
+            if len(text) > raw_chars:
+                text = text[:raw_chars] + " ..."
+            print(f"     {stem[:44]}  {v}/{c}")
+            print(f"       raw: {text!r}" if text else "       raw: <empty>")
+        if len(unparsed_rows) > max(top, 5):
+            print(f"     ... {len(unparsed_rows) - max(top, 5)} more; raise "
+                  f"--top to see them")
+
+    if rawlens and prefix.startswith(PASS2_PREFIX):
         med = statistics.median(rawlens)
         prose = sum(1 for L in rawlens if L > RATIONALE_MIN_CHARS) / len(rawlens)
         print(f"   rationale: median {med:.0f} chars, {prose:.1%} over "
@@ -328,7 +374,16 @@ def audit_cell(prefix, judge, dataset, rendered, top=3):
     return problems
 
 
-def audit(prefix=None, judges=None, datasets=None, top=3):
+def judges_for(prefix, judges):
+    """A pass-2 prefix is audited for PASS2_JUDGES only, even when the caller
+    asked for more -- see the note by PASS2_JUDGES. An explicit --judges still
+    narrows within that, it just cannot widen it."""
+    if prefix.startswith(PASS2_PREFIX):
+        return [j for j in judges if j in PASS2_JUDGES]
+    return judges
+
+
+def audit(prefix=None, judges=None, datasets=None, top=3, raw_chars=200):
     prefixes = [prefix] if prefix else discover_runs()
     judges = judges or list(CALLS)
     datasets = datasets or DATASETS
@@ -345,9 +400,13 @@ def audit(prefix=None, judges=None, datasets=None, top=3):
         print("\n" + "=" * 78)
         print(pfx)
         print("=" * 78)
-        for judge in judges:
+        use = judges_for(pfx, judges)
+        if pfx.startswith(PASS2_PREFIX):
+            print(f"pass-2 prefix: auditing {', '.join(use)} only")
+        for judge in use:
             for ds in datasets:
-                problems += audit_cell(pfx, judge, ds, rendered[ds], top=top)
+                problems += audit_cell(pfx, judge, ds, rendered[ds], top=top,
+                                       raw_chars=raw_chars)
 
     print("\n" + "=" * 78)
     if problems:
@@ -374,5 +433,8 @@ if __name__ == "__main__" and not in_notebook():
     ap.add_argument("--datasets", nargs="+", choices=DATASETS)
     ap.add_argument("--top", type=int, default=3,
                     help="example clips printed per gap class")
+    ap.add_argument("--raw-chars", type=int, default=200,
+                    help="how much of an unparsed reply to print")
     a = ap.parse_args()
-    audit(prefix=a.prefix, judges=a.judges, datasets=a.datasets, top=a.top)
+    audit(prefix=a.prefix, judges=a.judges, datasets=a.datasets, top=a.top,
+          raw_chars=a.raw_chars)
