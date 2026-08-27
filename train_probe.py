@@ -19,8 +19,14 @@ N_THRESH = 4          # PC>1, PC>2, PC>3, PC>4
 N_PERT = 2            # perturbations per training clip, fixed in the split
 PC_LEVELS = (1, 2, 3, 4, 5)
 
-# val-only; never trained on, evaluated by within-clip delta
+# held-out only; never trained on, evaluated by within-clip delta
 TEMPORAL_VARIANTS = ("shuffle", "reverse", "freeze")
+
+# The held-out splits carry the full variant set. Selection stays on val alone
+# -- cal must not touch early stopping -- but the reported numbers pool both,
+# because val is 10% and cal is 10%, so a val-only table uses half the clips
+# that exist.
+HELD_OUT_SPLITS = ("val", "cal")
 
 
 def variant_kind(name):
@@ -46,7 +52,8 @@ DEFAULTS = dict(
     alpha=1.0,          # weight on the perturbed PC loss
     lambda_cons=1.0,    # weight on the consistency penalty
     consistency="kl",   # kl | mse
-    arch=None,          # mlp | attn; inferred from the pack rank when None
+    arch=None,          # see ARCHS; inferred from the pack rank when None
+    conv_kernel=3,      # diff_conv only
     head="linear",      # linear | coral | corn
     logit_adjust=False,
     class_weight="inverse",  # none | inverse | sqrt_inverse
@@ -93,6 +100,26 @@ def load_pack(split, kind=None):
     shape = " x ".join(str(d) for d in pack["X"].shape[1:])
     print(f"  {split}: {len(pack['X'])} rows x {shape}")
     return pack
+
+
+def concat_packs(packs):
+    """Row-concatenate split packs so one eval can span them. Stems are unique
+    across splits by construction (a stem lives in exactly one split), so
+    group_by_stem still separates clips correctly."""
+    packs = [p for p in packs if p is not None and len(p["X"])]
+    if not packs:
+        raise ValueError("no packs to concatenate")
+    if len(packs) == 1:
+        return packs[0]
+    keys = set(packs[0])
+    for p in packs[1:]:
+        if set(p) != keys:
+            raise ValueError("packs carry different keys: "
+                             f"{sorted(keys)} vs {sorted(p)}")
+        if p["X"].shape[1:] != packs[0]["X"].shape[1:]:
+            raise ValueError("packs carry different feature shapes: "
+                             f"{packs[0]['X'].shape[1:]} vs {p['X'].shape[1:]}")
+    return {k: np.concatenate([p[k] for p in packs]) for k in keys}
 
 
 def group_by_stem(pack):
@@ -154,14 +181,19 @@ def build_eval(pack):
 
 # ----------------------------------------------------------------- model
 
-_ATTN_CLS = None
+_PROBE_CLASSES = None
+
+# every arch below consumes the [32,1024] packs; "mlp" is the rank-2 baseline
+TEMPORAL_ARCHS = ("attn", "mean_linear", "proj_mean", "diff_conv")
+ARCHS = ("mlp",) + TEMPORAL_ARCHS
 
 
-def _attentive_cls():
-    """Built on first use so importing this module still costs no torch."""
-    global _ATTN_CLS
-    if _ATTN_CLS is not None:
-        return _ATTN_CLS
+def _probe_classes():
+    """arch -> class. Built on first use so importing this module stays
+    torch-free."""
+    global _PROBE_CLASSES
+    if _PROBE_CLASSES is not None:
+        return _PROBE_CLASSES
 
     import torch
     import torch.nn as nn
@@ -187,7 +219,33 @@ def _attentive_cls():
                 return self.score(h) + self.bias
             return self.fc(h)
 
-    class AttentiveProbe(nn.Module):
+    class _HeadMixin:
+        """Everything the four temporal probes share downstream of pooling:
+        the eval-time logit adjustment and the corn conversion. Holds no
+        parameters, so mixing it into AttentiveProbe leaves its state_dict
+        keys -- and the mentor's init -- exactly as they were."""
+
+        def set_logit_adjust(self, vec):
+            """Subtract log(pos_weight) at prediction time. Eval only."""
+            self._adjust = vec
+
+        def _need_temporal(self, x):
+            if x.ndim != 3:
+                raise RuntimeError(f"expected (B, T, D) input, got "
+                                   f"{tuple(x.shape)}; this probe needs the "
+                                   f"temporal packs")
+            return x
+
+        def forward(self, x):
+            z = self.raw_logits(x)
+            if not self.training and self._adjust is not None:
+                z = z - self._adjust.to(z.device)
+            if self.head.kind == "corn":
+                p = torch.sigmoid(z).clamp(1e-6, 1 - 1e-6).cumprod(dim=-1)
+                z = torch.log(p) - torch.log1p(-p)
+            return z
+
+    class AttentiveProbe(_HeadMixin, nn.Module):
         """LayerNorm -> 1024->256 -> learned temporal positions -> single-query
         attentive pooling over the 32 moments -> ordinal head."""
 
@@ -207,10 +265,6 @@ def _attentive_cls():
             nn.init.normal_(self.pos, std=0.1)
             nn.init.normal_(self.query, std=0.2)
             self._adjust = None
-
-        def set_logit_adjust(self, vec):
-            """Subtract log(pos_weight) at prediction time. Eval only."""
-            self._adjust = vec
 
         def _tokens(self, x):
             if x.ndim != 3:
@@ -234,17 +288,86 @@ def _attentive_cls():
             pooled = (attn.unsqueeze(-1) * h).sum(dim=1)
             return self.head(self.drop(pooled))
 
-        def forward(self, x):
-            z = self.raw_logits(x)
-            if not self.training and self._adjust is not None:
-                z = z - self._adjust.to(z.device)
-            if self.head.kind == "corn":
-                p = torch.sigmoid(z).clamp(1e-6, 1 - 1e-6).cumprod(dim=-1)
-                z = torch.log(p) - torch.log1p(-p)
-            return z
+    class MeanLinearProbe(_HeadMixin, nn.Module):
+        """LayerNorm -> mean over the 32 moments -> linear ordinal head.
 
-    _ATTN_CLS = AttentiveProbe
-    return _ATTN_CLS
+        No projection and no nonlinearity: the floor of the ablation. Time is
+        averaged away before anything looks at it, so this probe is exactly
+        order-blind by construction -- its temporal deltas are the null the
+        other three are measured against."""
+
+        def __init__(self, cfg):
+            super().__init__()
+            self.norm = nn.LayerNorm(EMBED_DIM)
+            self.drop = nn.Dropout(cfg["dropout"])
+            self.head = OrdinalHead(EMBED_DIM, cfg.get("head", "linear"))
+            self._adjust = None
+
+        def raw_logits(self, x):
+            h = self.norm(self._need_temporal(x)).mean(dim=1)
+            return self.head(self.drop(h))
+
+    class ProjMeanProbe(_HeadMixin, nn.Module):
+        """LayerNorm -> 1024->hidden -> GELU -> mean over the moments -> head.
+
+        Identical to AttentiveProbe except the pooling is an unweighted mean,
+        so the pair isolates exactly what the attentive pooling buys. No
+        positional embedding: a mean is order-invariant, so adding pos before
+        it would only contribute a constant bias."""
+
+        def __init__(self, cfg):
+            super().__init__()
+            d = cfg["hidden"]
+            self.norm = nn.LayerNorm(EMBED_DIM)
+            self.proj = nn.Linear(EMBED_DIM, d)
+            self.act = nn.GELU()
+            self.drop = nn.Dropout(cfg["dropout"])
+            self.head = OrdinalHead(d, cfg.get("head", "linear"))
+            self._adjust = None
+
+        def raw_logits(self, x):
+            h = self.act(self.proj(self.norm(self._need_temporal(x))))
+            return self.head(self.drop(h.mean(dim=1)))
+
+    class DiffConvProbe(_HeadMixin, nn.Module):
+        """LayerNorm -> 1024->hidden -> first difference along time -> Conv1D
+        -> GELU -> mean over the 31 differences -> ordinal head.
+
+        The first difference is the point: it cancels the static appearance and
+        leaves only moment-to-moment change, so this is the one probe that can
+        ONLY see temporal structure. The projection is linear and the
+        nonlinearity comes after the conv, so the difference is taken in a
+        space where diff and projection commute. If shuffle/reverse fail to
+        move even this probe, the encoder is not carrying the order."""
+
+        def __init__(self, cfg):
+            super().__init__()
+            d = cfg["hidden"]
+            k = int(cfg.get("conv_kernel") or 3)
+            self.norm = nn.LayerNorm(EMBED_DIM)
+            self.proj = nn.Linear(EMBED_DIM, d)
+            self.conv = nn.Conv1d(d, d, kernel_size=k, padding=k // 2)
+            self.act = nn.GELU()
+            self.drop = nn.Dropout(cfg["dropout"])
+            self.head = OrdinalHead(d, cfg.get("head", "linear"))
+            self._adjust = None
+
+        def raw_logits(self, x):
+            h = self.proj(self.norm(self._need_temporal(x)))   # (B, T, d)
+            d1 = h[:, 1:] - h[:, :-1]                          # (B, T-1, d)
+            c = self.act(self.conv(d1.transpose(1, 2)))        # (B, d, T-1)
+            return self.head(self.drop(c.mean(dim=-1)))
+
+    _PROBE_CLASSES = {"attn": AttentiveProbe,
+                      "mean_linear": MeanLinearProbe,
+                      "proj_mean": ProjMeanProbe,
+                      "diff_conv": DiffConvProbe}
+    return _PROBE_CLASSES
+
+
+def _attentive_cls():
+    """Kept as a name because CLAUDE.md documents it."""
+    return _probe_classes()["attn"]
 
 
 def make_model(cfg):
@@ -252,20 +375,24 @@ def make_model(cfg):
     temporal rebuild still load."""
     import torch.nn as nn
 
-    if (cfg.get("arch") or "mlp") == "attn":
-        model = _attentive_cls()(cfg)
+    arch = cfg.get("arch") or "mlp"
+    classes = _probe_classes()
+    if arch in classes:
+        model = classes[arch](cfg)
         adj = cfg.get("logit_adjust_values")
         if adj:
             import torch
             model.set_logit_adjust(torch.tensor(adj, dtype=torch.float32))
         return model
+    if arch != "mlp":
+        raise ValueError(f"unknown arch {arch!r}; expected one of {ARCHS}")
 
     if cfg.get("head") == "corn":
-        raise ValueError("head='corn' needs the attentive probe; the "
+        raise ValueError("head='corn' needs one of the temporal probes; the "
                          "mean-pooled mlp path does not implement it")
     if cfg.get("logit_adjust_values"):
-        raise ValueError("logit adjustment is implemented on the attentive "
-                         "probe only")
+        raise ValueError("logit adjustment is implemented on the temporal "
+                         "probes only")
 
     return nn.Sequential(
         nn.LayerNorm(EMBED_DIM),
@@ -429,6 +556,97 @@ def _boot_ci(x, n_boot=2000, alpha=0.05, seed=0, stat=np.mean):
     return float(lo), float(hi)
 
 
+def compression(pred, y):
+    """Mean prediction at each human PC level, the span of those means, and the
+    regression slope of the level means on the level.
+
+    `slope` is fit on the five level means, NOT on the per-clip predictions, so
+    it stays comparable with every compression number reported before
+    2026-08-21. The two differ because the PC distribution is lopsided -- pc4
+    has ~10x the clips of pc1 -- so a per-clip fit weights the crowded levels
+    and a level-means fit treats all five alike, which is the right reading
+    next to `span`. `slope_clip` carries the per-clip fit for anyone who wants
+    it; they agree exactly whenever the level means are collinear.
+
+    For a perturbed variant `y` is the CLEAN clip's PC -- the variant's own true
+    score is unknown, and for a temporal one it is supposed to be lower. So a
+    variant row is read against the clean row, never as accuracy. Nothing here
+    is an MAE, which is exactly why it is computable on those rows at all."""
+    pred = np.asarray(pred, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    means, counts = {}, {}
+    for level in PC_LEVELS:
+        m = y == level
+        if m.any():
+            means[level] = float(pred[m].mean())
+            counts[level] = int(m.sum())
+
+    span, slope = float("nan"), float("nan")
+    if len(means) > 1:
+        span = max(means.values()) - min(means.values())
+        lv = np.array(sorted(means), dtype=np.float64)
+        mu = np.array([means[k] for k in sorted(means)], dtype=np.float64)
+        slope = float(((lv - lv.mean()) * (mu - mu.mean())).sum()
+                      / ((lv - lv.mean()) ** 2).sum())
+
+    var = y.var()
+    slope_clip = float("nan")
+    if var > 0:
+        slope_clip = float(((y - y.mean()) * (pred - pred.mean())).mean() / var)
+
+    return {"means": means, "counts": counts, "span": span, "slope": slope,
+            "slope_clip": slope_clip, "n": int(len(y))}
+
+
+def print_compression_table(clean, stats, indent="  "):
+    """The clean compression row, then the same columns for every perturbation,
+    grouped by taxonomy half.
+
+    The point of the table is the comparison down a column: a temporal
+    perturbation the probe actually notices should pull the level means down
+    and flatten the slope, and a superficial one should leave both alone.
+    """
+    if not clean:
+        return
+    levels = sorted(clean["means"])
+    w = 36
+
+    def row(name, c, ref=None):
+        line = f"{indent}{name:<{w}} {c['n']:>5}"
+        for lv in levels:
+            v = c["means"].get(lv)
+            line += f" {v:>7.3f}" if v is not None else f" {'-':>7}"
+        d = "--" if ref is None else f"{c['span'] - ref['span']:+.3f}"
+        print(line + f" {c['span']:>7.3f} {c['slope']:>7.3f} {d:>8}")
+
+    head = f"{indent}{'variant':<{w}} {'n':>5}"
+    for lv in levels:
+        head += f" {'pc' + str(lv):>7}"
+    print(head + f" {'span':>7} {'slope':>7} {'d span':>8}")
+    print(f"{indent}{'(n per level, clean)':<{w}} {'':>5}"
+          + "".join(f" {clean['counts'].get(lv, 0):>7}" for lv in levels))
+    row("clean", clean)
+
+    groups = defaultdict(list)
+    for name, r in stats.items():
+        if r.get("compression"):
+            groups[r["kind"]].append((name, r["compression"]))
+    for kind in sorted(groups, key=lambda k: {"temporal": 0}.get(k, 1)):
+        want = ("should SAG and FLATTEN" if kind == "temporal"
+                else "should sit on top of clean")
+        label = "sensitivity" if kind == "temporal" else "invariance"
+        print(f"{indent}-- expected-{label} ({want})")
+        for name, c in sorted(groups[kind]):
+            row(name, c, clean)
+
+    print(f"{indent}   level means are grouped by the CLEAN clip's human PC, "
+          "so a variant row is a shift")
+    print(f"{indent}   of the clean row, not an accuracy -- the true score of "
+          "a scrambled clip is")
+    print(f"{indent}   unknown. slope is fit on the five level means (not "
+          "per clip); 1.0 is calibrated.")
+
+
 def _cos_features(a, b):
     """Per-clip cosine between clean and variant features. For the [32,1024]
     packs this is the mean of the 32 per-moment cosines: moment t against
@@ -494,7 +712,8 @@ def evaluate(model, clean, y, variants, device, batch=1024, n_boot=0, seed=0,
         for name, (rows, mask) in variants.items():
             if not mask.any():
                 continue
-            d = (score(rows).cpu().numpy() - base)[mask]
+            pv = score(rows).cpu().numpy()
+            d = (pv - base)[mask]
             cos = _cos_features(clean[mask], rows[mask])
             gaps[name] = float(np.abs(d).mean())
             signed[name] = float(d.mean())
@@ -503,7 +722,8 @@ def evaluate(model, clean, y, variants, device, batch=1024, n_boot=0, seed=0,
                    "median_abs": float(np.median(np.abs(d))),
                    "p95_abs": float(np.percentile(np.abs(d), 95)),
                    "frac_over_half": float((np.abs(d) > 0.5).mean()),
-                   "cos": float(cos.mean()), "cos_min": float(cos.min())}
+                   "cos": float(cos.mean()), "cos_min": float(cos.min()),
+                   "compression": compression(pv[mask], np.asarray(y)[mask])}
             if n_boot:
                 row["signed_ci"] = _boot_ci(d, n_boot, seed=seed)
                 row["abs_ci"] = _boot_ci(np.abs(d), n_boot, seed=seed)
@@ -519,6 +739,7 @@ def evaluate(model, clean, y, variants, device, batch=1024, n_boot=0, seed=0,
     tmp = [signed[n] for n in gaps if variant_kind(n) == "temporal"]
     return {"mae": mae, "rmse": rmse, "macro_mae": macro_mae, "rho": rho,
             "gaps": gaps, "signed": signed, "variant_stats": stats,
+            "compression": compression(base, y),
             "attention": att,
             "mean_gap": float(np.mean(sup)) if sup else 0.0,
             "mean_temporal_signed": float(np.mean(tmp)) if tmp else float("nan"),
@@ -567,6 +788,38 @@ def print_headline(m, indent="  ", label=""):
           f"  rho {m['rho']:+.4f}")
 
 
+def per_split_headline(model, packs, splits, device):
+    """Clean metrics for each held-out split on its own, so the pooled number
+    can never hide one split doing the work. val was used to pick the epoch,
+    so it is mildly optimistic; cal is untouched."""
+    out = {}
+    for split in splits:
+        clean, y, _, _ = build_eval(packs[split])
+        m = evaluate(model, clean, y, {}, device, attn=False)
+        out[split] = {"n": int(len(y)), "mae": m["mae"],
+                      "macro_mae": m["macro_mae"], "rho": m["rho"]}
+    return out
+
+
+def print_heldout(h, indent="  "):
+    """The pooled held-out block: per-split headline, then the variant table."""
+    label = "+".join(h["splits"])
+    print(f"{indent}=== held-out ({label}, {h['n']} clips) ===")
+    for split, r in h["per_split"].items():
+        note = " (used for early stopping)" if split == "val" else " (untouched)"
+        print(f"{indent}  {split:<5} n {r['n']:>4}  mae {r['mae']:.4f}   "
+              f"macro_mae {r['macro_mae']:.4f}   rho {r['rho']:+.4f}{note}")
+    print_headline(h, indent=indent + "  ", label="pooled ")
+    print(f"{indent}  mean invariance gap (superficial only) "
+          f"{h['mean_gap']:.4f}")
+    print()
+    print_variant_table(h["variant_stats"], indent=indent + "  ")
+    print()
+    print(f"{indent}  -- compression, {label} --")
+    print_compression_table(h.get("compression"), h["variant_stats"],
+                            indent=indent + "  ")
+
+
 # ---------------------------------------------------------------- train
 
 def train(device=None, verbose=True, packs=None, **overrides):
@@ -582,27 +835,40 @@ def train(device=None, verbose=True, packs=None, **overrides):
 
     if packs is None:
         print("loading packs ...")
-        packs = {s: load_pack(s) for s in ("train", "val")}
+        packs = {s: load_pack(s) for s in ("train",) + HELD_OUT_SPLITS}
 
     Xc, Xp, y, _ = build_train(packs["train"])
+    # selection is on val alone -- cal must never touch early stopping --
+    # but the final tables pool both held-out splits
     ev_clean, ev_y, ev_variants, _ = build_eval(packs["val"])
+    ho_splits = tuple(s for s in HELD_OUT_SPLITS if s in packs)
+    ho = (build_eval(concat_packs([packs[s] for s in ho_splits]))
+          if len(ho_splits) > 1 else None)
 
-    # the pack is self-describing: rank 2 is mean-pooled, rank 3 temporal
+    # the pack is self-describing: rank 2 is mean-pooled, rank 3 temporal.
+    # An explicit --arch still has to agree with the pack it was handed.
     if cfg["arch"] is None:
         cfg["arch"] = "attn" if Xc.ndim == 3 else "mlp"
-    if cfg["arch"] == "attn":
+    if cfg["arch"] in TEMPORAL_ARCHS:
         if Xc.ndim != 3:
-            raise ValueError("arch='attn' needs the [32,1024] packs; got "
-                             f"features of shape {Xc.shape[1:]}")
+            raise ValueError(f"arch={cfg['arch']!r} needs the [32,1024] packs; "
+                             f"got features of shape {Xc.shape[1:]}")
         cfg["n_temporal"] = int(Xc.shape[1])
-    elif Xc.ndim != 2:
-        raise ValueError("arch='mlp' needs the mean-pooled packs; got features "
-                         f"of shape {Xc.shape[1:]}")
+    elif cfg["arch"] == "mlp":
+        if Xc.ndim != 2:
+            raise ValueError("arch='mlp' needs the mean-pooled packs; got "
+                             f"features of shape {Xc.shape[1:]}")
+    else:
+        raise ValueError(f"unknown arch {cfg['arch']!r}; expected one of {ARCHS}")
 
     if verbose:
         counts = {p: int((y == p).sum()) for p in PC_LEVELS}
         print(f"  train {len(y)} clips {counts}")
-        print(f"  val   {len(ev_y)} clips, {len(ev_variants)} perturbation types")
+        print(f"  val   {len(ev_y)} clips, {len(ev_variants)} perturbation "
+              f"types  (selection set)")
+        if ho:
+            print(f"  held-out {len(ho[1])} clips over {'+'.join(ho_splits)}, "
+                  f"{len(ho[2])} perturbation types  (reporting set)")
         kinds = defaultdict(list)
         for v in sorted(ev_variants):
             kinds[variant_kind(v)].append(v)
@@ -634,10 +900,10 @@ def train(device=None, verbose=True, packs=None, **overrides):
         return weighted_bce(bce, model(x), tgt, weights)
     cw = clip_weights(yt, cfg["class_weight"]).to(device)
 
+    n_params = sum(p.numel() for p in model.parameters())
     if verbose:
-        n_par = sum(p.numel() for p in model.parameters())
         print(f"  arch={cfg['arch']} head={cfg['head']} "
-              f"hidden={cfg['hidden']} params={n_par/1e3:.0f}K")
+              f"hidden={cfg['hidden']} params={n_params/1e3:.0f}K")
         print(f"  pos_weight per threshold"
               f"{' (conditional)' if corn else ''}: "
               f"{', '.join(f'{v:.3f}' for v in pw.tolist())}")
@@ -764,10 +1030,21 @@ def train(device=None, verbose=True, packs=None, **overrides):
     final = evaluate(model, ev_clean, ev_y, ev_variants, device,
                      n_boot=cfg["n_boot"], seed=cfg["seed"])
     best["variant_stats"] = final["variant_stats"]
+    best["compression"] = final["compression"]
     if unselected:
         best.update({k: final[k] for k in
                      ("mae", "rmse", "macro_mae", "rho", "mean_gap", "gaps",
                       "signed", "mean_temporal_signed", "attention")})
+
+    # the same checkpoint on every held-out clip, not just the selection half
+    if ho:
+        ho_clean, ho_y, ho_variants, _ = ho
+        h = evaluate(model, ho_clean, ho_y, ho_variants, device,
+                     n_boot=cfg["n_boot"], seed=cfg["seed"])
+        h.pop("pred_clean")
+        best["heldout"] = dict(h, splits=list(ho_splits), n=int(len(ho_y)),
+                               per_split=per_split_headline(
+                                   model, packs, ho_splits, device))
 
     if verbose:
         print(f"\n  {ran} epochs in {secs:.1f}s ({secs/ran*1000:.0f} ms/epoch)"
@@ -784,9 +1061,16 @@ def train(device=None, verbose=True, packs=None, **overrides):
                   f"{att['uniform_weight']:.4f}")
         print()
         print_variant_table(best["variant_stats"], indent="    ")
+        print()
+        print("    === compression (val) ===")
+        print_compression_table(best["compression"], best["variant_stats"],
+                                indent="    ")
+        if best.get("heldout"):
+            print()
+            print_heldout(best["heldout"], indent="    ")
 
     return {"cfg": cfg, "best": best, "history": history, "epochs_run": ran,
-            "early_stopped": stopped is not None,
+            "early_stopped": stopped is not None, "params": n_params,
             "seconds": secs, "device": device}
 
 
@@ -801,6 +1085,7 @@ def save_probe(result, name="probe_v1", push_to_s3=True):
                  "signed", "mean_temporal_signed", "variant_stats",
                  "attention", "epoch") if k in result["best"]},
         "history": result["history"],
+        "heldout": result["best"].get("heldout"),
         "embed_dim": EMBED_DIM,
         "n_thresh": N_THRESH,
     }
@@ -829,10 +1114,85 @@ def push_probe(name="probe_v1"):
     return key
 
 
+def ablation(archs=TEMPORAL_ARCHS, device=None, packs=None, **overrides):
+    """The mentor's 2026-08-21 ablation: one probe per architecture, same
+    embeddings, same split, same objective and hyperparameters, so the only
+    thing that varies is how the 32 moments get pooled.
+
+    His framing is that adding shuffle/reverse/freeze to *training* would
+    engineer the result -- there is no human PC label for a scrambled clip --
+    so the temporal question gets answered by varying the architecture instead
+    and reading the within-clip deltas, which need no label.
+
+    Selection is clean-val macro MAE for every arch (the mentor named it);
+    Spearman is printed beside it as secondary evidence, never as the
+    selector."""
+    if packs is None:
+        print("loading packs ...")
+        packs = {s: load_pack(s) for s in ("train",) + HELD_OUT_SPLITS}
+
+    runs = {}
+    for arch in archs:
+        print(f"\n=== arch={arch} ===")
+        r = train(device=device, verbose=False, packs=packs, arch=arch,
+                  **overrides)
+        runs[arch] = r
+        b = r["best"]
+        print(f"  best epoch {b['epoch']}  macro {b['macro_mae']:.4f}  "
+              f"mae {b['mae']:.4f}  rho {b['rho']:+.3f}  "
+              f"({r['seconds']:.1f}s, {r['epochs_run']} epochs)")
+
+    cfg = next(iter(runs.values()))["cfg"]
+    print(f"\n  identical for every row: select={cfg['select']} "
+          f"lr={cfg['lr']} wd={cfg['weight_decay']} bs={cfg['batch_size']} "
+          f"hidden={cfg['hidden']} dropout={cfg['dropout']} "
+          f"alpha={cfg['alpha']} lambda_cons={cfg['lambda_cons']} "
+          f"consistency={cfg['consistency']} class_weight={cfg['class_weight']} "
+          f"head={cfg['head']} seed={cfg['seed']}")
+
+    def block(key, title):
+        print(f"\n  -- {title} --")
+        print(f"  {'arch':<13} {'params':>8} {'epoch':>6} {'macro':>8} "
+              f"{'mae':>8} {'rho':>8} {'nuisance |d|':>13} {'nuisance d':>11} "
+              f"{'temporal d':>11} {'H/logT':>7}")
+        for arch in archs:
+            b = runs[arch]["best"]
+            m = (b.get(key) or b) if key else b
+            att = b.get("attention")
+            sup = [v for k, v in m["signed"].items()
+                   if variant_kind(k) == "superficial"]
+            print(f"  {arch:<13} {runs[arch]['params']/1e3:>7.0f}K "
+                  f"{b['epoch']:>6} {m['macro_mae']:>8.4f} {m['mae']:>8.4f} "
+                  f"{m['rho']:>+8.3f} {m['mean_gap']:>13.4f} "
+                  f"{np.mean(sup) if sup else float('nan'):>+11.4f} "
+                  f"{m.get('mean_temporal_signed', float('nan')):>+11.4f} "
+                  + (f"{att['normalized']:>7.3f}" if att else f"{'-':>7}"))
+
+    block(None, "val (the selection split)")
+    if next(iter(runs.values()))["best"].get("heldout"):
+        block("heldout", "held-out (val+cal, the reporting set)")
+
+    print(f"\n  -- signed delta per temporal perturbation "
+          "(these SHOULD be negative) --")
+    tmp = sorted(TEMPORAL_VARIANTS)
+    print(f"  {'arch':<13}" + "".join(f" {t:>10}" for t in tmp))
+    for arch in archs:
+        b = runs[arch]["best"]
+        m = b.get("heldout") or b
+        print(f"  {arch:<13}"
+              + "".join(f" {m['signed'].get(t, float('nan')):>+10.4f}"
+                        for t in tmp))
+    print("  mean_linear averages time away before the head sees it, so its "
+          "row is the")
+    print("  order-blind null -- read every other row against it, not "
+          "against zero.")
+    return runs
+
+
 def sweep(lambdas=(0.0, 10.0, 100.0, 1000.0), device=None, **overrides):
     """One training per lambda on shared packs."""
     print("loading packs ...")
-    packs = {s: load_pack(s) for s in ("train", "val")}
+    packs = {s: load_pack(s) for s in ("train",) + HELD_OUT_SPLITS}
 
     runs = []
     for lam in lambdas:
@@ -841,21 +1201,25 @@ def sweep(lambdas=(0.0, 10.0, 100.0, 1000.0), device=None, **overrides):
                   lambda_cons=lam, **overrides)
         runs.append(r)
         att = r["best"].get("attention")
-        print(f"  val mae {r['best']['mae']:.4f}   "
-              f"macro {r['best']['macro_mae']:.4f}   "
-              f"rho {r['best']['rho']:+.3f}   "
-              f"mean gap {r['best']['mean_gap']:.4f}   "
+        m = r["best"].get("heldout") or r["best"]
+        tag = "held-out" if r["best"].get("heldout") else "val"
+        print(f"  {tag} mae {m['mae']:.4f}   "
+              f"macro {m['macro_mae']:.4f}   "
+              f"rho {m['rho']:+.3f}   "
+              f"mean gap {m['mean_gap']:.4f}   "
               + (f"H {att['normalized']:.3f}   " if att else "")
               + f"({r['seconds']:.1f}s)")
 
-    print(f"\n  {'lambda':>8} {'val mae':>9} {'macro':>9} {'rho':>7} "
+    print(f"\n  {'lambda':>8} {'ho mae':>9} {'macro':>9} {'rho':>7} "
           f"{'sup gap':>9} {'temporal d':>11} {'H/logT':>7} {'epoch':>6}")
+    print("  metrics are the pooled held-out set where available, else val")
     for lam, r in zip(lambdas, runs):
         b = r["best"]
+        m = b.get("heldout") or b
         att = b.get("attention")
-        print(f"  {lam:>8} {b['mae']:>9.4f} {b['macro_mae']:>9.4f} "
-              f"{b['rho']:>+7.3f} {b['mean_gap']:>9.4f} "
-              f"{b.get('mean_temporal_signed', float('nan')):>+11.4f} "
+        print(f"  {lam:>8} {m['mae']:>9.4f} {m['macro_mae']:>9.4f} "
+              f"{m['rho']:>+7.3f} {m['mean_gap']:>9.4f} "
+              f"{m.get('mean_temporal_signed', float('nan')):>+11.4f} "
               + (f"{att['normalized']:>7.3f} " if att else f"{'-':>7} ")
               + f"{b['epoch']:>6}")
     return runs
@@ -869,8 +1233,13 @@ if __name__ == "__main__" and not in_notebook():
     for k in ("dropout", "lr", "weight_decay", "alpha", "lambda_cons"):
         ap.add_argument(f"--{k.replace('_', '-')}", type=float, default=None)
     ap.add_argument("--consistency", choices=["mse", "kl"], default=None)
-    ap.add_argument("--arch", choices=["mlp", "attn"], default=None,
-                    help="default: inferred from the pack rank")
+    ap.add_argument("--arch", choices=list(ARCHS), default=None,
+                    help="default: inferred from the pack rank (attn on t32)")
+    ap.add_argument("--conv-kernel", type=int, default=None,
+                    help="diff_conv only")
+    ap.add_argument("--ablation", action="store_true",
+                    help="train every temporal arch on shared packs and "
+                         "print the comparison table")
     ap.add_argument("--head", choices=["linear", "coral", "corn"],
                     default=None)
     ap.add_argument("--logit-adjust", action="store_true", default=None,
@@ -892,7 +1261,12 @@ if __name__ == "__main__" and not in_notebook():
     lams, name, no_push = a.pop("sweep"), a.pop("name"), a.pop("no_push")
     dev = a.pop("device")
     PACK_KIND = a.pop("packs")
-    if lams:
+    abl = a.pop("ablation")
+    if abl:
+        a.pop("arch")   # the ablation is over arch; a fixed one makes no sense
+        for arch, r in ablation(device=dev, **a).items():
+            save_probe(r, name=f"{name}_{arch}", push_to_s3=not no_push)
+    elif lams:
         sweep(lams, device=dev, **a)
     else:
         save_probe(train(device=dev, **a), name=name, push_to_s3=not no_push)
