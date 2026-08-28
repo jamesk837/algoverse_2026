@@ -33,16 +33,60 @@ from pathlib import Path
 
 import numpy as np
 
-# On EC2 this imports from the sibling file. In Colab train_probe.py is pasted
-# into an earlier cell, so these names are already global and the import fails
-# harmlessly -- same pattern as eval_probe.py / diagnose_probe.py.
-try:
-    from train_probe import (BUCKET, PROBE_PREFIX, PACK_PREFIXES, PACK_KIND,
-                             EMBED_DIM, N_TEMPORAL, N_THRESH, build_eval,
-                             expected_pc, load_pack, make_model, train,
-                             _ensure_s3, _rankdata, _spearman)
-except ImportError:
-    pass
+# Everything this file borrows from train_probe. Bound by _adopt() below.
+_NEEDED = ("BUCKET", "PROBE_PREFIX", "PACK_PREFIXES", "PACK_KIND", "EMBED_DIM",
+           "N_TEMPORAL", "N_THRESH", "build_eval", "expected_pc", "load_pack",
+           "make_model", "train", "_ensure_s3", "_rankdata", "_spearman")
+
+
+def _adopt():
+    """Bind train_probe's names into this module, from wherever they live.
+
+    Two workflows have to work. On EC2 (and in Colab when both files are
+    fetched with wget) `import train_probe` succeeds. In the paste-into-a-cell
+    workflow train_probe.py was executed in the notebook, so its names are
+    attributes of __main__ instead.
+
+    eval_probe.py and diagnose_probe.py do this as a bare
+    `except ImportError: pass`, which is wrong in a way that only shows up
+    later: it cannot tell "train_probe is not a module here, use the globals"
+    apart from "train_probe exists but boto3 is missing". The second case left
+    every name unbound and surfaced ~200 lines away as a NameError inside
+    check_calibration. Hit for real in Colab, 2026-08-27 -- Colab does not
+    ship boto3, which train_probe imports at module scope. So: try the module,
+    then __main__, then fail LOUDLY at import time saying which it was.
+    """
+    reason = None
+    try:
+        import train_probe as tp
+    except Exception as e:                    # ImportError, but also anything
+        tp = None                             # train_probe raises on import
+        reason = f"{type(e).__name__}: {e}"
+
+    if tp is not None:
+        missing = [n for n in _NEEDED if not hasattr(tp, n)]
+        if missing:
+            raise ImportError(
+                f"train_probe imported but is missing {missing}. It is "
+                "probably an older copy -- re-fetch it alongside this file.")
+        globals().update({n: getattr(tp, n) for n in _NEEDED})
+        return "train_probe module"
+
+    import __main__ as m                      # the pasted-cell workflow
+    if all(hasattr(m, n) for n in _NEEDED):
+        globals().update({n: getattr(m, n) for n in _NEEDED})
+        return "__main__ (train_probe was pasted into a cell)"
+
+    raise ImportError(
+        f"could not import train_probe ({reason}), and its names are not in "
+        "__main__ either, so lock_probe has nothing to build on.\n"
+        "  - if that reason is a missing package, install it: train_probe "
+        "needs boto3 and numpy (Colab does not ship boto3)\n"
+        "  - otherwise put train_probe.py in the working directory, or paste "
+        "it into an earlier cell before this file")
+
+
+_SOURCE = _adopt()
 
 # Duplicated rather than imported, deliberately: the import above is
 # best-effort (it fails by design in Colab), and a default argument binds at
