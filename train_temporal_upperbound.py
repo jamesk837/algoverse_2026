@@ -168,20 +168,28 @@ def _match(stem, feats):
     return alt if alt in feats else None
 
 
-def human_confirmed(version="v1"):
+def human_confirmed(version="v1", raters=None):
     """-> {(stem, variant): {"pref_clean": int, "n": int, "margin": float}}
 
     A pair is counted when a blinded rater expressed a preference (not tie /
     not skipped) on a temporal variant. `pref_clean` is how many raters picked
     the clean clip; `margin` is mean (pc_clean - pc_variant) where both were
     rated. A pair is "confirmed" downstream when pref_clean / n > 0.5.
+
+    raters= restricts to those annotator names (the jsonl basename, e.g.
+    "joseph"). Use it to report the diagnostic against one consistent rater
+    when the others only did a handful of clips.
     """
+    keep = set(raters) if raters else None
     keys = _list(f"{ANNOT_PREFIX}/{version}/")
     keys = [k for k in keys if k.endswith(".jsonl")]
+    if keep:
+        keys = [k for k in keys if k.rsplit("/", 1)[-1][:-6] in keep]
     if not keys:
-        raise RuntimeError(f"no annotation records under {ANNOT_PREFIX}/{version}/")
+        raise RuntimeError(f"no annotation records under {ANNOT_PREFIX}/{version}/"
+                           + (f" for raters {sorted(keep)}" if keep else ""))
     acc = {}
-    raters = set()
+    raters_seen = set()
     for k in keys:
         body = _ensure_s3().get_object(Bucket=BUCKET, Key=k)["Body"].read()
         for line in body.decode().splitlines():
@@ -197,7 +205,7 @@ def human_confirmed(version="v1"):
             stem = r.get("stem") or r.get("clip")   # annotate.py writes "stem"
             if not stem:
                 continue
-            raters.add(r.get("rater") or k.rsplit("/", 1)[-1][:-6])
+            raters_seen.add(r.get("rater") or k.rsplit("/", 1)[-1][:-6])
             key = (stem, r["variant"])
             a = acc.setdefault(key, {"pref_clean": 0, "n": 0, "margins": []})
             a["n"] += 1
@@ -212,7 +220,7 @@ def human_confirmed(version="v1"):
                     "margin": float(np.mean(a["margins"])) if a["margins"]
                     else float("nan")}
     print(f"  {len(out)} (clip, temporal-variant) pairs rated by "
-          f"{len(raters)} rater(s): {sorted(r for r in raters if r)}")
+          f"{len(raters_seen)} rater(s): {sorted(x for x in raters_seen if x)}")
     return out
 
 
@@ -403,7 +411,7 @@ def distance_auc(rows):
 
 def run(datasets=BENCHMARK_DATASETS, version="v1", k=5, hidden=32,
         epochs=300, lr=1e-3, wd=1e-3, margin=0.5, seed=0,
-        min_confirmed=6, name=OUT_NAME, push_to_s3=True):
+        min_confirmed=6, raters=None, name=OUT_NAME, push_to_s3=True):
     _adopt()
     t0 = time.time()
 
@@ -424,7 +432,7 @@ def run(datasets=BENCHMARK_DATASETS, version="v1", k=5, hidden=32,
                            "them too)")
 
     print("\nhuman labels:")
-    conf = human_confirmed(version)
+    conf = human_confirmed(version, raters=raters)
     rows = assemble(feats, conf, require_confirmed=(min_confirmed > 0))
     n_conf_total = sum(r["confirmed"] for r in rows)
     if n_conf_total < min_confirmed:
@@ -603,6 +611,9 @@ if __name__ == "__main__" and not _in_notebook():
     ap.add_argument("--margin", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--min-confirmed", type=int, default=6)
+    ap.add_argument("--rater", nargs="+", default=None,
+                    help="restrict to these annotator names "
+                         "(jsonl basenames, e.g. joseph)")
     ap.add_argument("--name", default=OUT_NAME)
     ap.add_argument("--no-push", action="store_true")
     a = ap.parse_args()
@@ -610,5 +621,6 @@ if __name__ == "__main__" and not _in_notebook():
         sys.exit(0 if selftest() else 1)
     run(datasets=a.datasets, version=a.version, k=a.folds, hidden=a.hidden,
         epochs=a.epochs, lr=a.lr, wd=a.weight_decay, margin=a.margin,
-        seed=a.seed, min_confirmed=a.min_confirmed, name=a.name,
+        seed=a.seed, min_confirmed=a.min_confirmed, raters=a.rater,
+        name=a.name,
         push_to_s3=not a.no_push)
