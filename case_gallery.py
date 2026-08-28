@@ -72,6 +72,13 @@ DS_TO_DVKEY = {"test": "videophy2_test", "implausibench_real": "implausibench_re
 DS_TO_ATTACKDIR = {"test": "test", "implausibench_real": "implausibench_real",
                    "implausibench_implausible": "implausibench_implausible"}
 CSV_KEY = "datasets/videophy2_test/_metadata/videophy2_test.csv"
+DATASET_PREFIXES = {
+    "test": "datasets/videophy2_test/",
+    "implausibench_real": "datasets/implausibench/ImplausiBench/real/",
+    "implausibench_implausible": "datasets/implausibench/ImplausiBench/implausible/",
+}
+VIDEO_SUFFIXES = (".mp4", ".webm", ".avi", ".mov", ".mkv")
+_SRC_CACHE = {}
 DV_KEY = "reference/probe_locked/dv.json"
 PASS1 = "results/pass1"
 PASS2 = "results/pass2"
@@ -222,8 +229,8 @@ def _norm(judge, x):
     return (x - SCALE_LO[judge]) / SCALE_SPAN[judge]
 
 
-def select(version="v1", n_superficial=2, n_temporal=2, n_clean_over=2,
-           n_clean_under=2, seed="cg-2026", push_to_s3=True):
+def select(version="v1", n_superficial=2, n_temporal=2, n_clean_over=1,
+           n_clean_under=1, seed="cg-2026", push_to_s3=True):
     """Freeze the case set. Attack track: per judge, the biggest ΔJ−ΔV on a
     superficial attack (inflation) and the smallest score drop on a temporal
     one (blindness). Clean track: per judge, the worst over- and under-scorers
@@ -284,7 +291,8 @@ def select(version="v1", n_superficial=2, n_temporal=2, n_clean_over=2,
                     judge_clean=round(jc, 4), judge_variant=round(jv, 4),
                     dJ_norm=round(dJ, 4),
                     dV_norm=None if dV is None else round(dV, 4),
-                    gap=round(gap, 4), human_pc=None, human_sa=None))
+                    gap=round(gap, 4), human_pc=None, human_sa=None,
+                    source_key=_resolve_source(ds, stem)))
             else:
                 _, resid, ds, stem, jc, lab = r
                 cases.append(dict(
@@ -293,7 +301,8 @@ def select(version="v1", n_superficial=2, n_temporal=2, n_clean_over=2,
                     judge_clean=round(jc, 4), judge_variant=None,
                     dJ_norm=None, dV_norm=None,
                     gap=round(resid, 4),
-                    human_pc=lab[0], human_sa=lab[1]))
+                    human_pc=lab[0], human_sa=lab[1],
+                    source_key=_resolve_source(ds, stem)))
 
     # de-dup by case_id, then present in a fixed but non-informative order
     uniq = {c["case_id"]: c for c in cases}
@@ -337,19 +346,67 @@ def load_cases(version="v1"):
 _MIME = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}
 
 
+def _stem_of(key):
+    return os.path.splitext(os.path.basename(key.split("?")[0]))[0]
+
+
+def _source_map(dataset):
+    """{stem -> source object key} from datasets/<prefix>/. The clean clip IS
+    the source object; attacks/ holds only the rendered variants."""
+    if dataset not in _SRC_CACHE:
+        m = {}
+        for k in _list(DATASET_PREFIXES[dataset]):
+            if k.lower().endswith(VIDEO_SUFFIXES) and "/_metadata/" not in k:
+                m[_stem_of(k)] = k
+        _SRC_CACHE[dataset] = m
+    return _SRC_CACHE[dataset]
+
+
+def _resolve_source(dataset, stem):
+    m = _source_map(dataset)
+    return (m.get(stem) or m.get(stem.removesuffix("_result"))
+            or m.get(stem + "_result"))
+
+
+def _clean_key(case):
+    """clean video: the stored source_key, else look it up, else the (rare)
+    attacks/.../clean.mp4."""
+    return (case.get("source_key") or _resolve_source(case["dataset"], case["stem"])
+            or _clip_key(case["dataset"], case["stem"], "clean"))
+
+
 def _clip_key(dataset, stem, variant):
     return f"attacks/{DS_TO_ATTACKDIR[dataset]}/{stem}/{variant}.mp4"
 
 
+def _alt_keys(key):
+    """Same object under a toggled `_result` stem segment -- attacks/ dir names
+    and pass-1 clip stems have historically differed on that suffix."""
+    yield key
+    parts = key.split("/")
+    for i, seg in enumerate(parts):
+        if seg.endswith("_result"):
+            alt = parts[:]; alt[i] = seg[:-7]; yield "/".join(alt)
+        elif i and parts[i - 1] in ("test", "implausibench_real",
+                                    "implausibench_implausible") and "." not in seg:
+            alt = parts[:]; alt[i] = seg + "_result"; yield "/".join(alt)
+
+
 def _download(key):
+    if key is None:
+        return None
     dst = TMP / key.replace("/", "__")
-    if not dst.exists():
-        dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for k in _alt_keys(key):
         try:
-            dst.write_bytes(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-        except Exception as exc:                      # noqa: BLE001
-            return None
-    return dst
+            body = s3.get_object(Bucket=BUCKET, Key=k)["Body"].read()
+        except Exception:
+            continue
+        dst.write_bytes(body)
+        return dst
+    return None
 
 
 def _video_html(path, label, width=360):
@@ -466,7 +523,7 @@ def code(coder, version="v1"):
                       f"<code>{c['case_id']}</code></h3>"
                       f"<div style='font:13px sans-serif'>judge <b>{c['judge']}</b>"
                       f" &nbsp; track <b>{c['track']}</b></div>")
-        clean_p = _download(_clip_key(c["dataset"], c["stem"], "clean"))
+        clean_p = _download(_clean_key(c))
         html = _video_html(clean_p, "clean")
         if c["variant"] != "clean":
             var_p = _download(_clip_key(c["dataset"], c["stem"], c["variant"]))
@@ -688,7 +745,7 @@ def adjudicate(version="v1", adjudicator="adj"):
         head.value = (f"<h3>{st['i']+1}/{len(todo)} &nbsp; <code>{cid}</code></h3>"
                       f"{ca}: <b>{by_coder[ca][cid]['failure_mode']}</b> &nbsp; "
                       f"{cb}: <b>{by_coder[cb][cid]['failure_mode']}</b>")
-        cp = _download(_clip_key(c["dataset"], c["stem"], "clean"))
+        cp = _download(_clean_key(c))
         h = _video_html(cp, "clean")
         if c["variant"] != "clean":
             h += _video_html(_download(_clip_key(c["dataset"], c["stem"], c["variant"])),
@@ -773,8 +830,8 @@ if __name__ == "__main__" and not _in_notebook():
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--n-superficial", type=int, default=2)
     ap.add_argument("--n-temporal", type=int, default=2)
-    ap.add_argument("--n-clean-over", type=int, default=2)
-    ap.add_argument("--n-clean-under", type=int, default=2)
+    ap.add_argument("--n-clean-over", type=int, default=1)
+    ap.add_argument("--n-clean-under", type=int, default=1)
     a = ap.parse_args()
     if a.selftest:
         sys.exit(0 if selftest() else 1)
