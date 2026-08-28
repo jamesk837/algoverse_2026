@@ -194,8 +194,11 @@ def human_confirmed(version="v1"):
             pref = r.get("preference")
             if pref not in ("clean", "variant", "tie"):
                 continue
-            raters.add(r.get("rater"))
-            key = (r["clip"], r["variant"])
+            stem = r.get("stem") or r.get("clip")   # annotate.py writes "stem"
+            if not stem:
+                continue
+            raters.add(r.get("rater") or k.rsplit("/", 1)[-1][:-6])
+            key = (stem, r["variant"])
             a = acc.setdefault(key, {"pref_clean": 0, "n": 0, "margins": []})
             a["n"] += 1
             if pref == "clean":
