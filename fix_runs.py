@@ -223,6 +223,15 @@ def scan(prefixes=None, datasets=None):
                 seen = Counter(v for _, r in recs for v in r.get("runs", {}))
                 top = max(seen.values()) if seen else 0
                 want = [v for v in VARIANTS if seen.get(v, 0) >= 0.5 * top]
+                is_subset = len(want) < len(VARIANTS)
+
+                # A clip that was never touched has no result object, so it has
+                # no key to read and cannot be found by walking records -- the
+                # gap has to come from the corpus side. Only for a full run: a
+                # subset run is not expected to cover every clip.
+                have_stems = {r.get("clip") for _, r in recs}
+                absent = ([s for s in rendered[ds] if s not in have_stems]
+                          if not is_subset else [])
 
                 n_records += len(recs)
                 clips, calls, per_variant = 0, 0, Counter()
@@ -248,9 +257,15 @@ def scan(prefixes=None, datasets=None):
                     if gap:
                         clips += 1
                         calls += gap
+                # an unscored clip owes every call on every variant it has
+                for stem in absent:
+                    n = len([v for v in want if v in rendered[ds][stem]])
+                    calls += n * len(call_ids)
+                    clips += 1
+
                 if calls:
                     to_rerun[(prefix, judge, ds)] = {
-                        "clips": clips, "calls": calls,
+                        "clips": clips, "calls": calls, "absent": len(absent),
                         "variants": per_variant, "want": want}
 
     print(f"  read {n_records} records, {n_calls} stored calls -> "
@@ -504,7 +519,12 @@ def plan(prefixes=None, datasets=None, logdir=None):
     for (prefix, judge, ds), info in sorted(to_rerun.items()):
         vs = ", ".join(f"{v}({n})" for v, n in info["variants"].most_common(4))
         print(f"\n  {prefix}/{judge}/{ds}")
-        print(f"    {info['calls']} calls over {info['clips']} clip(s): {vs}")
+        print(f"    {info['calls']} calls over {info['clips']} clip(s)")
+        if info.get("absent"):
+            print(f"      {info['absent']} clip(s) have NO result object at "
+                  f"all -- never scored")
+        if vs:
+            print(f"      gaps inside existing records: {vs}")
         kw = rerun_kwargs(prefix, ds, info["want"])
         kw["models"] = [judge]
         args = ", ".join(f"{k}={v!r}" for k, v in kw.items())
