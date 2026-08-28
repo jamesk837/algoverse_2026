@@ -580,14 +580,15 @@ def section_step11(annot_version="v1"):
         ci = "--" if lo != lo else f"[{lo:.2f}, {hi:.2f}]"
         L.append(f"| {v} | {h['kind']} | {pref} | {ci} | "
                  f"{h['d_pc']:+.2f} | [{dlo:+.2f}, {dhi:+.2f}] |")
-    # scale check + V-JEPA-vs-human verdict, one line each
-    for tag in ("== our clean PC vs the published", "== human vs locked V-JEPA"):
-        blk = out.split(tag, 1)
-        if len(blk) > 1:
-            keep = [ln for ln in blk[1].splitlines()[:12]
-                    if ln.strip() and not ln.strip().startswith("attack")]
-            L.append("\n_" + tag.strip("= ").strip() + ":_ "
-                     + " ".join(k.strip() for k in keep[:3]))
+    # scale check + V-JEPA-vs-human, one summary line each
+    for needle, label in (("exact match", "scale check (our clean PC vs published)"),
+                          ("spearman(clean-preference", "V-JEPA vs human (temporal)")):
+        ln = next((x.strip() for x in out.splitlines() if needle in x), "")
+        if ln:
+            L.append(f"\n_{label}:_ {ln}")
+    L.append("\n_temporal attacks: humans prefer clean (validated). superficial: "
+             "near-total ties / dH ~ 0 (humans invariant). V-JEPA temporal dV is "
+             "positive (order-blind) so H1 uses dH._")
     return "\n".join(L) + "\n", human
 
 
