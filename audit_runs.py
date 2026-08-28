@@ -127,9 +127,14 @@ ZERO_OK = {("vila_ewm", "instruction")}
 
 # (prefix, judge, dataset) whose missing/absent clips are known and expected.
 # Gaps there are still counted and printed; they just do not raise a PROBLEM.
-IGNORE_MISSING = {
-    ("results/paraphrase/p0", "phyjudge_9b", "implausibench_implausible"),
-}
+#
+# Empty on purpose. This held results/paraphrase/p0 x phyjudge_9b x
+# implausibench_implausible, which suppressed a real 35-clip hole -- p0's
+# implausible arm was at 115 clips against p1's 150, so the two paraphrase runs
+# were not on the same footing for that corpus and the audit said nothing.
+# Suppress a gap here only while it is being deliberately left alone, and take
+# the entry back out when it is fixed.
+IGNORE_MISSING = set()
 
 RATIONALE_MIN_CHARS = 60   # a pass-2 reply at or under this carries no prose
 
