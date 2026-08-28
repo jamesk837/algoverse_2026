@@ -533,15 +533,30 @@ def section_step10():
                  f"`predict_vjepa.py --report`; then `decide_predictor_probe.py`. "
                  f"Otherwise this step is optional and can be marked deferred._\n")
         return "\n".join(L) + "\n"
-    L.append(f"- statistic: {rep.get('stat')}, spike P{rep.get('spike_percentile')}, "
+    verdict = _get_text(f"predictor/{PRED_MODEL}/verdict.txt").strip() \
+        if _exists(f"predictor/{PRED_MODEL}/verdict.txt") else None
+    if verdict:
+        L.append(f"- **decision (6-stat sweep, decide_predictor_probe): {verdict}**\n")
+    L.append(f"- statistic shown: {rep.get('stat')}, spike P{rep.get('spike_percentile')}, "
              f"threshold {rep.get('threshold'):.4g}, n = {rep.get('n_clips')} clips\n")
     L.append("| variant | kind | d | 95% CI | AUC |")
     L.append("|---|---|---|---|---|")
     for name, r in sorted(rep.get("variants", {}).items(),
                           key=lambda kv: (kv[1].get("kind", "z"), kv[0])):
+        if str(name).startswith("copy:"):
+            continue
         L.append(f"| {name} | {r.get('kind')} | {r.get('d', float('nan')):+.4f} | "
                  f"[{r.get('lo', float('nan')):+.4f}, {r.get('hi', float('nan')):+.4f}] | "
                  f"{r.get('auc', float('nan')):.3f} |")
+    dcsv = _get_text(f"predictor/{PRED_MODEL}/decision.csv") \
+        if _exists(f"predictor/{PRED_MODEL}/decision.csv") else None
+    if dcsv:
+        import csv as _csv
+        rows = list(_csv.DictReader(io.StringIO(dcsv)))
+        sig = [(r["stat"], r["variant"], r["kind"]) for r in rows
+               if r.get("significant") in ("True", "true", "1")]
+        L.append("\n_significant rises (CI>0), (stat, variant, kind): "
+                 + (", ".join(f"{s}/{v}/{k}" for s, v, k in sig) or "none") + "._")
     return "\n".join(L) + "\n"
 
 
@@ -731,39 +746,44 @@ def section_step12(temporal_idx):
     step12 = [r for r in _read_deltas_csv() if r["group"].startswith("step12_")]
     T1 = ("shuffle", "freeze", "caption_echo_rubric_vocab")
 
+    def _cell(judge, ds, v):
+        m = next((r for r in step12 if r["judge"] == judge
+                  and r["dataset"] == ds and r["variant"] == v), None)
+        return m
+
     L.append("### Table 1 - reference-relative gap  d = dJ - dV  "
-             "(VideoPhy-2 test, n=450, [95% CI])\n")
-    L.append("| judge | " + " | ".join(T1) + " |")
-    L.append("|---|---|---|---|")
+             "(per dataset, [95% CI])\n")
+    L.append("| judge | dataset | shuffle | freeze | caption_echo_rubric_vocab |")
+    L.append("|---|---|---|---|---|")
     for judge in JUDGES:
-        cells = []
-        for v in T1:
-            m = next((r for r in step12 if r["judge"] == judge
-                      and r["dataset"] == "test" and r["variant"] == v), None)
-            cells.append(f"{float(m['signed_delta']):+.3f} "
-                         f"[{float(m['ci_lo']):+.3f}, {float(m['ci_hi']):+.3f}]"
-                         if m else "--")
-        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+        for ds in DATASETS:
+            cells = []
+            for v in T1:
+                m = _cell(judge, ds, v)
+                cells.append(f"{float(m['signed_delta']):+.3f} "
+                             f"[{float(m['ci_lo']):+.3f}, {float(m['ci_hi']):+.3f}]"
+                             if m else "--")
+            L.append(f"| {judge} | {ds} | " + " | ".join(cells) + " |")
 
     L.append("\n### H2 - superficial-cue inflation index  d = dJ - dV  "
-             "(test, * = 95% CI excludes 0)\n")
-    L.append("| judge | " + " | ".join(v.replace("caption_echo_", "")
-                                       for v in SUPERFICIAL) + " |")
-    L.append("|" + "---|" * (len(SUPERFICIAL) + 1))
+             "(per dataset, * = 95% CI excludes 0)\n")
+    L.append("| judge | dataset | " + " | ".join(v.replace("caption_echo_", "")
+                                                 for v in SUPERFICIAL) + " |")
+    L.append("|" + "---|" * (len(SUPERFICIAL) + 2))
     h2_judges = set()
     for judge in JUDGES:
-        cells = []
-        for v in SUPERFICIAL:
-            m = next((r for r in step12 if r["judge"] == judge
-                      and r["dataset"] == "test" and r["variant"] == v), None)
-            if not m:
-                cells.append("--")
-                continue
-            star = "*" if float(m["ci_lo"]) > 0 else ""
-            if star:
-                h2_judges.add(judge)
-            cells.append(f"{float(m['signed_delta']):+.3f}{star}")
-        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+        for ds in DATASETS:
+            cells = []
+            for v in SUPERFICIAL:
+                m = _cell(judge, ds, v)
+                if not m:
+                    cells.append("--")
+                    continue
+                star = "*" if float(m["ci_lo"]) > 0 else ""
+                if star and ds == "test":
+                    h2_judges.add(judge)
+                cells.append(f"{float(m['signed_delta']):+.3f}{star}")
+            L.append(f"| {judge} | {ds} | " + " | ".join(cells) + " |")
 
     fam_judges = defaultdict(set)
     for r in step12:
@@ -972,6 +992,113 @@ def _ablation_10_11():
     return "\n".join(L) + "\n"
 
 
+CLIP_TARGETS = {"test": 450, "implausibench_real": 150,
+                "implausibench_implausible": 150}
+_CALLS_N = {"phyjudge_9b": 16, "vila_ewm": 8, "videophy2_auto": 2}
+_ALL_VARIANTS = ["clean"] + list(TEMPORAL) + SUPERFICIAL
+
+
+def section_step4():
+    """Pass-1 coverage / quality audit -- the gate. Native run only."""
+    L = ["## Step 4 - Pass-1 coverage & quality audit\n",
+         "| judge | dataset | clips | complete | unparsed calls | % complete |",
+         "|---|---|---|---|---|---|"]
+    ok_all = True
+    for judge in JUDGES:
+        ncall = _CALLS_N[judge]
+        for ds in DATASETS:
+            keys = [k for k in _list(f"results/pass1/{judge}/{ds}/")
+                    if k.endswith(".json")]
+            recs = [r for r in _get_many(keys) if r]
+            complete = unparsed = 0
+            for rec in recs:
+                runs = rec.get("runs", {})
+                nvar = sum(1 for v in _ALL_VARIANTS if runs.get(v, {}).get("calls"))
+                nbad = sum(1 for v in runs.values() for c in v.get("calls", {}).values()
+                           if c.get("parsed") is None)
+                unparsed += nbad
+                got = sum(len(v.get("calls", {})) for v in runs.values())
+                if nvar >= 10 and got >= 10 * ncall and nbad == 0:
+                    complete += 1
+            pct = complete / len(recs) if recs else 0.0
+            if pct < 0.99:
+                ok_all = False
+            L.append(f"| {judge} | {ds} | {len(recs)} | {complete} | "
+                     f"{unparsed} | {pct:.0%} |")
+    tail = "PASSES" if ok_all else ("has gaps -- see check_complete.py / "
+                                    "audit_runs.py for the incomplete-clip list")
+    L.append(f"\n_audit {tail}._")
+    return "\n".join(L) + "\n"
+
+
+def _sanity_real():
+    """Real-video sanity control (ablations 1 & 7): clean score + photometric dJ
+    on ImplausiBench real."""
+    L = ["## Real-video sanity control (ImplausiBench real, physics score)\n",
+         "| judge | clean mean | photometric dJ | 95% CI |", "|---|---|---|---|"]
+    d = _read_deltas_csv()
+    for judge in JUDGES:
+        base = load_pass("results/pass1", judge, "implausibench_real",
+                         PHYS_GROUP_CALL[judge])
+        cm = np.mean([_normphys(judge, v["clean"]) for v in base.values()
+                      if "clean" in v]) if base else float("nan")
+        m = next((r for r in d if r["judge"] == judge
+                  and r["dataset"] == "implausibench_real"
+                  and r["group"] == PHYS_GROUP[judge]
+                  and r["variant"] == "photometric"), None)
+        pj = (f"{float(m['signed_delta']):+.3f}", f"[{float(m['ci_lo']):+.3f}, "
+              f"{float(m['ci_hi']):+.3f}]") if m else ("--", "--")
+        L.append(f"| {judge} | {cm:.3f} | {pj[0]} | {pj[1]} |")
+    L.append("\n_judges are not collapsed/saturated on valid real physics, and "
+             "photometric alone does not shift the score._")
+    return "\n".join(L) + "\n"
+
+
+def _by_level_judges():
+    """Step 8 addendum: clean judge score stratified by human PC level (test)."""
+    labs = human_labels()
+    L = ["## Step 8 (cont.) - clean judge score by human PC level (test, "
+         "normalized)\n", "| human PC | " + " | ".join(JUDGES) + " |",
+         "|" + "---|" * (len(JUDGES) + 1)]
+    per = {j: defaultdict(list) for j in JUDGES}
+    for judge in JUDGES:
+        for stem, pv in load_pass("results/pass1", judge, "test",
+                                  PHYS_GROUP_CALL[judge]).items():
+            lab = _lab(labs, stem)
+            if lab and "clean" in pv:
+                per[judge][lab[0]].append(_normphys(judge, pv["clean"]))
+    for lvl in (1, 2, 3, 4, 5):
+        cells = [f"{np.mean(per[j][lvl]):.3f}" if per[j][lvl] else "--"
+                 for j in JUDGES]
+        L.append(f"| {lvl} | " + " | ".join(cells) + " |")
+    return "\n".join(L) + "\n"
+
+
+def _reliability_cards(temporal_idx):
+    """Per-judge 2x2 reliability card: expected-sensitivity (temporal, should
+    DROP) x expected-invariance (superficial, should NOT rise)."""
+    d = [r for r in _read_deltas_csv() if r["group"].startswith("step12_")
+         and r["dataset"] == "test"]
+    tix = defaultdict(dict)
+    for (j, v, mn, lo, hi) in temporal_idx.get("rows", []):
+        tix[j][v] = lo > 0
+    L = ["## Per-judge 2x2 reliability cards (test)\n"]
+    for judge in JUDGES:
+        sup = [r for r in d if r["judge"] == judge and r["variant"] in SUPERFICIAL]
+        infl = [r["variant"] for r in sup if float(r["ci_lo"]) > 0]
+        h1 = sum(tix[judge].values())
+        worst = max(sup, key=lambda r: float(r["signed_delta"]), default=None)
+        L.append(f"**{judge}**  ")
+        L.append(f"- expected-sensitivity (temporal): fails to drop on "
+                 f"{h1}/3 attacks (dJ-dH index CI>0)  ")
+        L.append(f"- expected-invariance (superficial): inflated on "
+                 f"{len(infl)}/6 cues [{', '.join(x.replace('caption_echo_','') for x in infl) or 'none'}]  ")
+        if worst:
+            L.append(f"- worst superficial gap: {worst['variant'].replace('caption_echo_','')} "
+                     f"d = {float(worst['signed_delta']):+.3f}\n")
+    return "\n".join(L) + "\n"
+
+
 # ======================================================================
 # build
 # ======================================================================
@@ -990,6 +1117,7 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
         analyze_txt = "[--no-analyze: skipped]"
 
     print("5.1 ..."); s51 = section_5_1()
+    print("Step 4 ..."); s4 = section_step4() if lean else ""
     print("Step 9 ..."); s9 = section_step9()
     s9_txt, _ = s9 if isinstance(s9, tuple) else (s9, {})
     print("Step 9.5 ..."); s95 = section_step9_5()
@@ -999,7 +1127,9 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     print("Step 12 ..."); s12_txt, verdicts = section_step12(tidx)
     print("Step 13 ..."); s13 = section_step13()
     print("Step 6 / 7 ..."); s67 = _lean_step6_7() if lean else ""
-    print("Step 8 ..."); s8 = _step8_alignment() if lean else ""
+    print("Step 8 ..."); s8 = (_step8_alignment() + "\n" + _by_level_judges()) if lean else ""
+    print("sanity / cards ..."); sanity = _sanity_real() if lean else ""
+    cards = _reliability_cards(tidx) if lean else ""
     print("Ablations 10 / 11 ..."); ab = _ablation_10_11() if lean else ""
 
     header = ("# Results\n\n_generated "
@@ -1007,7 +1137,8 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
               + "## Verdicts\n\n" + "\n".join(verdicts) + "\n")
 
     if lean:
-        parts = [header, s51, s67, s8, s9_txt, s95, s10, s11_txt, s12_txt, s13, ab]
+        parts = [header, s4, s51, s67, s8, s9_txt, s95, s10, s11_txt, sanity,
+                 s12_txt, s13, ab, cards]
     else:
         parts = [header, s51, s9_txt, s95, s10, s11_txt, s12_txt, s13,
                  "## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
