@@ -177,7 +177,7 @@ def variants_for(entry, doc, has_train=None):
 
 def plan(doc, limit=None, workers=E.CACHE_READ_WORKERS):
     """-> [(stem, [missing variants])], resumable per (clip, variant)."""
-    cached = cached_stems()
+    cached = cached_stems(doc["clips"])
     todo, have, n_want = [], 0, 0
     has_train = has_train_split(doc)
     stems = sorted(doc["clips"])
@@ -202,28 +202,50 @@ def err_key(stem):
     return f"{ERR_PREFIX}/{E.safe_local_name(stem)}.npz"
 
 
-def cached_stems():
-    """{stem: {variant}} from one LIST plus parallel GETs of the headers."""
+def cached_stems(want=None):
+    """{stem: {variant}} from one LIST plus parallel GETs of the headers.
+
+    `want` is the real stems the caller will look up, and passing it is a
+    correctness requirement, not an optimisation. Objects are keyed by
+    `safe_local_name`, which truncates and hashes any stem over 80 characters
+    -- and VideoPhy-2 stems are caption-derived, so most of them are mangled.
+    Keyed by the S3 name alone, every long stem looks uncached forever: plan()
+    reports it missing on every run, it is recomputed, and it is written back
+    over the identical key. Nothing is corrupted (`read_cached` goes through
+    `err_key` and finds it, so the merge is correct and `collect` reads the
+    full cache) -- the cost is silently repeated GPU work and a run that can
+    never converge. Without `want` the mapping cannot be inverted, so the raw
+    key-stem dict is returned as-is.
+    """
     keys = E.list_keys(ERR_PREFIX + "/")
     if not keys:
         return {}
-    out = {}
-    stems = [Path(k).stem for k in keys]
+    key_stems = [Path(k).stem for k in keys]
+    if want is not None:
+        # read only the clips this corpus asked about: the bodies carry the
+        # per-token errors, so scanning the whole prefix is hundreds of MB on
+        # every plan() call, and run_all makes one per corpus
+        keep = {E.safe_local_name(s) for s in want}
+        key_stems = [k for k in key_stems if k in keep]
 
-    def read(stem):
+    def read(key_stem):
         try:
             body = E._ensure_s3().get_object(
-                Bucket=BUCKET, Key=f"{ERR_PREFIX}/{stem}.npz")["Body"].read()
+                Bucket=BUCKET,
+                Key=f"{ERR_PREFIX}/{key_stem}.npz")["Body"].read()
             with np.load(io.BytesIO(body), allow_pickle=False) as z:
-                return stem, {k[4:] for k in z.files if k.startswith("err_")}
+                return key_stem, {k[4:] for k in z.files
+                                  if k.startswith("err_")}
         except Exception:
-            return stem, set()
+            return key_stem, set()
 
+    out = {}
     with ThreadPoolExecutor(max_workers=E.CACHE_READ_WORKERS) as pool:
-        for stem, variants in pool.map(read, stems):
-            out[stem] = variants
-    # keys are safe_local_name'd; map back by matching on the stored real stem
-    return {k: v for k, v in out.items()}
+        for key_stem, variants in pool.map(read, key_stems):
+            out[key_stem] = variants
+    if want is None:
+        return out
+    return {s: out[k] for s in want if (k := E.safe_local_name(s)) in out}
 
 
 # ------------------------------------------------------------------ model
@@ -950,6 +972,17 @@ def selftest():
                   False, type(e).__name__)
     check("the default is the faithful mode", CONTEXT_MODE == "masked",
           CONTEXT_MODE)
+
+    print("cache keys")
+    # the bug this pins: cached_stems() used to key on the S3 name while
+    # plan() looked up the real stem, so every mangled stem was recomputed
+    # on every run, forever and invisibly
+    long_stem = "clip_" + "a" * 200
+    check("a long stem is mangled in its S3 key",
+          Path(err_key(long_stem)).stem != long_stem)
+    check("the cache map-back uses the name err_key writes with",
+          Path(err_key(long_stem)).stem == E.safe_local_name(long_stem)
+          and Path(err_key("short_stem")).stem == "short_stem")
 
     print("corpus selection")
     doc = {"superficial_variants": ["photometric", "caption_echo_rubric_vocab"],
