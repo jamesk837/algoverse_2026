@@ -817,7 +817,7 @@ def _step8_alignment():
     stem_scores = {}
     for judge in JUDGES:
         h, m, sc = [], [], {}
-        for stem, pv in load_pass(PASS1, judge, "test", PHYS_GROUP_CALL[judge]).items():
+        for stem, pv in load_pass("results/pass1", judge, "test", PHYS_GROUP_CALL[judge]).items():
             lab = _lab(labs, stem)
             if lab and "clean" in pv:
                 h.append((lab[0] - 1) / 4.0)
