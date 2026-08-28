@@ -620,18 +620,28 @@ def run_all(datasets="train", device=None, dry_run=False, context=CONTEXT,
 
 
 def verify(device=None, n_clips=3, context=CONTEXT, model=None):
-    """Run BEFORE the full run. Three things, in the order they can break.
+    """Run BEFORE the full run, and sweep `context` while you are here.
 
-    1. do the predictor weights match the checkpoint (strict=False can leave
-       them random);
-    2. does the trained predictor beat copying the previous moment (a loaded-
-       as-noise predictor will not);
+    Three things, in the order they can break:
+
+    1. do the predictor weights match the checkpoint;
+    2. does the trained predictor beat copying the previous moment;
     3. does a shuffled clip surprise it more than its clean original.
 
-    (3) is a sanity check on the pipeline, NOT the result and NOT a selection
-    criterion -- the config is pinned in this file before any of it runs.
+    (2) is the one that picks `context`, and it is a CLEAN-CLIP criterion:
+    "is the predictor operating in a regime where it is doing better than
+    nothing", asked without reference to any attack. Choosing context on the
+    shuffle column instead would be selecting the configuration on the result,
+    which is the thing this project structurally refuses to do everywhere
+    else. The shuffle column is printed as a pipeline check only.
+
+    Why context needs sweeping at all: one moment is 576 of 18432 tokens, ~3%
+    of the clip. V-JEPA's training masks leave most of the clip visible, so at
+    context=1 the predictor is far enough out of distribution that a trivial
+    copy beats it.
     """
     import torch
+    contexts = [context] if isinstance(context, int) else sorted(context)
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     doc = E.load_split()
@@ -640,12 +650,12 @@ def verify(device=None, n_clips=3, context=CONTEXT, model=None):
     ho = E.held_out_splits(doc)
     stems = [s for s in sorted(doc["clips"])
              if doc["clips"][s]["split"] in ho][:n_clips]
-    print(f"\nchecking {len(stems)} held-out clips (context={context})")
-    print("  both context modes are run so the faithful one can be shown to "
-          "work before a\n  long run commits to it, and so the leak in 'full' "
-          "is a measured number.")
-    print(f"\n  {'clip':<24} {'mode':<7} {'pred':>9} {'copy':>9} {'ratio':>7} "
-          f"{'shuffle':>9} {'d':>9}")
+    print(f"\nchecking {len(stems)} held-out clips, context {contexts}")
+    print("  both context modes run, so the faithful one is shown to work "
+          "before a long run\n  commits to it and the leak in 'full' is a "
+          "measured number rather than a worry.")
+    print(f"\n  {'clip':<20} {'ctx':>3} {'mode':<7} {'pred':>9} {'copy':>9} "
+          f"{'ratio':>7} {'shuffle':>9} {'d':>9}")
 
     ok, usable = True, {}
     for stem in stems:
@@ -653,55 +663,66 @@ def verify(device=None, n_clips=3, context=CONTEXT, model=None):
             clean = E.read_clip(E.download_video(E.video_key(doc, stem, "clean")))
             shuf = E.read_clip(E.download_video(
                 E.video_key(doc, stem, "shuffle")))
-            base = copy_baseline(processor, encoder, clean, device, context)
         except Exception as e:
-            print(f"  {stem[:24]:<24} FAILED loading: {type(e).__name__}: {e}")
+            print(f"  {stem[:20]:<20} FAILED loading: {type(e).__name__}: {e}")
             ok = False
             continue
 
-        for mode in ("masked", "full"):
-            try:
-                e_clean, _, _ = predict_errors(processor, encoder, predictor,
-                                               clean, device, context,
-                                               context_mode=mode)
-                e_shuf, _, _ = predict_errors(processor, encoder, predictor,
-                                              shuf, device, context,
-                                              context_mode=mode)
-            except Exception as e:
-                print(f"  {stem[:24]:<24} {mode:<7} FAILED "
-                      f"{type(e).__name__}: {e}")
-                usable.setdefault(mode, []).append(False)
-                continue
-            r = float(e_clean.mean() / base.mean())
-            usable.setdefault(mode, []).append(r < 1.0)
-            print(f"  {stem[:24]:<24} {mode:<7} {e_clean.mean():>9.4f} "
-                  f"{base.mean():>9.4f} {r:>7.3f} {e_shuf.mean():>9.4f} "
-                  f"{float(e_shuf.mean() - e_clean.mean()):>+9.4f}")
+        for ctx in contexts:
+            base = copy_baseline(processor, encoder, clean, device, ctx)
+            for mode in ("masked", "full"):
+                try:
+                    e_clean, _, _ = predict_errors(processor, encoder,
+                                                   predictor, clean, device,
+                                                   ctx, context_mode=mode)
+                    e_shuf, _, _ = predict_errors(processor, encoder,
+                                                  predictor, shuf, device,
+                                                  ctx, context_mode=mode)
+                except Exception as e:
+                    print(f"  {stem[:20]:<20} {ctx:>3} {mode:<7} FAILED "
+                          f"{type(e).__name__}: {e}")
+                    usable.setdefault((ctx, mode), []).append(False)
+                    continue
+                r = float(e_clean.mean() / base.mean())
+                usable.setdefault((ctx, mode), []).append(r < 1.0)
+                print(f"  {stem[:20]:<20} {ctx:>3} {mode:<7} "
+                      f"{e_clean.mean():>9.4f} {base.mean():>9.4f} "
+                      f"{r:>7.3f} {e_shuf.mean():>9.4f} "
+                      f"{float(e_shuf.mean() - e_clean.mean()):>+9.4f}")
 
-    print()
-    for mode in ("masked", "full"):
-        got = usable.get(mode, [])
-        state = ("beats the copy baseline on all "
-                 f"{len(got)}" if got and all(got) else "DID NOT WORK")
-        print(f"  {mode:<7} {state}")
-    good = bool(usable.get(CONTEXT_MODE)) and all(usable.get(CONTEXT_MODE, []))
-    ok = ok and good
+    print(f"\n  {'context':>8}  {'mode':<8} verdict")
+    best = None
+    for key in sorted(usable):
+        got = usable[key]
+        good = bool(got) and all(got)
+        print(f"  {key[0]:>8}  {key[1]:<8} "
+              + (f"beats the copy baseline {len(got)}/{len(got)}"
+                 if good else "does NOT beat copying"))
+        # smallest usable context wins: it keeps the error SEQUENCE longest,
+        # which is what the P90/P95/spike-rate statistics are computed over
+        if good and best is None:
+            best = key
 
-    if not good:
-        other = "full" if CONTEXT_MODE == "masked" else "masked"
-        print(f"\n  PROBLEM: the default mode ({CONTEXT_MODE}) is not usable.")
-        if usable.get(other) and all(usable[other]):
-            print(f"  {other} works -- rerun with --context-mode {other} and "
-                  "record the deviation.")
-        else:
-            print("  Neither mode beats copying the previous moment. Either "
-                  "the predictor weights\n  did not load, or the causal masks "
-                  "are not addressing moments -- check\n  embed_vjepa.py "
-                  "--verify-axis before anything else.")
+    if best:
+        print(f"\n  OK: context={best[0]}, mode={best[1]}. Run the full pass "
+              f"with --context {best[0]}.")
+        print("  (smallest usable context, so the error sequence stays as "
+              "long as possible)")
+    else:
+        print("\n  PROBLEM: nothing beat copying the previous moment. Read "
+              "the cause off this run\n  rather than guessing:")
+        print("   - weights: load_models printed matched/total above. All "
+              "matched means the model\n     is fine and this is not a load "
+              "failure.")
+        print("   - masks: if the shuffle column moves at all, the masks ARE "
+              "addressing moments.")
+        print("   - context: one moment is ~3% of the clip. Sweep it -- "
+              "--context 1 4 8 16 --\n     before suspecting anything else.")
+    ok = ok and bool(best)
 
-    print("\n  the shuffle column is a pipeline sanity check, NOT the result "
-          "and not a\n  selection criterion: the config is pinned at the top "
-          "of this file before any\n  of it runs.")
+    print("\n  the shuffle column is a pipeline check, NOT the result and NOT "
+          "the selection\n  criterion: context is chosen on the clean-clip "
+          "copy baseline alone.")
     return ok
 
 
@@ -940,7 +961,8 @@ if __name__ == "__main__" and not in_notebook():
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--context", type=int, default=CONTEXT)
+    ap.add_argument("--context", type=int, nargs="+", default=[CONTEXT],
+                    help="one value for a run; several sweep it in --verify")
     ap.add_argument("--context-mode", choices=["masked", "full"],
                     default=CONTEXT_MODE,
                     help="masked: encode the context from only the patches "
@@ -969,6 +991,9 @@ if __name__ == "__main__" and not in_notebook():
     if a.report:
         report(stat=a.stat, push_to_s3=not a.no_push)
     else:
+        if len(a.context) != 1:
+            raise SystemExit("--context takes one value for a run; "
+                             "several are only for --verify")
         run_all(datasets=a.datasets, device=a.device, dry_run=a.dry_run,
-                context=a.context, store_tokens=not a.no_tokens,
+                context=a.context[0], store_tokens=not a.no_tokens,
                 limit=a.limit, context_mode=a.context_mode)
