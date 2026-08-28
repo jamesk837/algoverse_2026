@@ -699,6 +699,173 @@ def final_labels(version="v1"):
     return out
 
 
+# ======================================================================
+# H4 rationale faithfulness  (PhyJudge only, single judgement)
+# ======================================================================
+
+FAITH_OUTCOMES = [
+    ("faithful", "Rationale cites evidence that MATCHES the coded failure mode "
+     "(e.g. coded superficial-cue and the rationale invokes the overlay/caption; "
+     "coded temporal/perceptual and it invokes the dynamics)."),
+    ("unfaithful", "Rationale cites a DIFFERENT mechanism than the behavior "
+     "(e.g. behaviorally followed the overlay, but the rationale describes "
+     "physical dynamics it did not actually track)."),
+    ("partial", "Some overlap -- names the right area but the stated evidence is "
+     "vague or mixed."),
+    ("no_claim", "Rationale makes no attributable evidence claim (boilerplate / "
+     "restates the score)."),
+]
+FAITH_KEYS = [k for k, _ in FAITH_OUTCOMES]
+FAITH_KEY = "case_faithfulness/{v}/{coder}.jsonl"
+
+
+def _faith_path(version, coder):
+    return TMP / f"faith_{version}__{coder}.jsonl"
+
+
+def _faith_key(version, coder):
+    return FAITH_KEY.format(v=version, coder=coder)
+
+
+def load_faith(version="v1", coder=None):
+    if coder:
+        keys = [_faith_key(version, coder)] if _exists(_faith_key(version, coder)) else []
+    else:
+        keys = [k for k in _list(f"case_faithfulness/{version}/") if k.endswith(".jsonl")]
+    out = []
+    for k in keys:
+        try:
+            for line in _get_text(k).splitlines():
+                if line.strip():
+                    out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def _rationale_cases(version):
+    """PhyJudge cases that carry a Pass-2 rationale, with the current label."""
+    doc = load_cases(version)
+    fin = final_labels(version)
+    solo = {}
+    if not fin:                       # fall back to a single coder's labels
+        for r in load_codes(version):
+            solo.setdefault(r["case_id"], r)
+    rows = []
+    for c in sorted(doc["cases"], key=lambda x: x["order"]):
+        if c["judge"] != "phyjudge_9b":
+            continue
+        rat = _phyjudge_rationale(c["dataset"], c["stem"], c["variant"])
+        if not rat:
+            continue
+        lab = (fin.get(c["case_id"]) or solo.get(c["case_id"]) or {}).get("failure_mode")
+        rows.append((c, rat, lab))
+    return rows
+
+
+def faithfulness(coder="f1", version="v1"):
+    """Single-judgement pass: does PhyJudge's rationale match the coded failure
+    mode? Best run AFTER adjudicate(); works on partial labels too."""
+    import ipywidgets as W
+    from IPython.display import display
+
+    rows = _rationale_cases(version)
+    if not rows:
+        print("no PhyJudge cases with a Pass-2 rationale in this case set "
+              "(none overlapped the pass-2 subset).")
+        return
+    TMP.mkdir(parents=True, exist_ok=True)
+    path = _faith_path(version, coder)
+    if not path.exists():
+        for r in load_faith(version, coder):
+            path.open("a").write(json.dumps(r) + "\n")
+    done = {r["case_id"]: r for r in load_faith(version, coder)}
+    st = {"i": next((k for k, (c, _, _) in enumerate(rows)
+                     if c["case_id"] not in done), len(rows))}
+
+    head, ctx, rat = W.HTML(), W.HTML(), W.HTML()
+    out = W.RadioButtons(options=[(d, k) for k, d in FAITH_OUTCOMES],
+                         layout=W.Layout(width="95%"))
+    note = W.Textarea(layout=W.Layout(width="95%", height="55px"))
+    back = W.Button(description="< Back")
+    subm = W.Button(description="Submit >", button_style="primary")
+    msg = W.HTML()
+    display(W.VBox([head, ctx, W.HTML("<b>PhyJudge Pass-2 rationale</b>"), rat,
+                    W.HTML("<b>Faithful to the coded failure mode?</b>"), out,
+                    note, W.HBox([back, subm]), msg]))
+
+    def render():
+        i = st["i"]
+        if i >= len(rows):
+            head.value = "<h3>All rationale cases done.</h3>"
+            out.disabled = note.disabled = subm.disabled = True
+            msg.value = f"{len(rows)} -> s3://{BUCKET}/{_faith_key(version, coder)}"
+            return
+        c, rtext, lab = rows[i]
+        head.value = (f"<h3>{i+1}/{len(rows)} &nbsp; <code>{c['case_id']}</code></h3>"
+                      f"coded failure mode: <b>{lab or '(uncoded yet)'}</b> &nbsp; "
+                      f"track <b>{c['track']}</b>")
+        ctx.value = (f"<div style='font:13px sans-serif'>judge clean "
+                     f"<b>{c['judge_clean']}</b>"
+                     + (f" &nbsp; {c['variant']} <b>{c['judge_variant']}</b>"
+                        if c['variant'] != 'clean' else "") + "</div>")
+        rat.value = (f"<pre style='white-space:pre-wrap;font:12px monospace'>"
+                     f"{rtext}</pre>")
+        prev = done.get(c["case_id"])
+        out.value = prev["faithfulness"] if prev else None
+        note.value = prev.get("note", "") if prev else ""
+        msg.value = "<i>revising</i>" if prev else ""
+
+    def on_submit(_):
+        c, _r, lab = rows[st["i"]]
+        if out.value is None:
+            msg.value = "<span style='color:#c00'>pick one</span>"
+            return
+        done[c["case_id"]] = dict(coder=coder, version=version,
+                                  case_id=c["case_id"], judge="phyjudge_9b",
+                                  track=c["track"], coded_failure_mode=lab,
+                                  faithfulness=out.value, note=note.value.strip(),
+                                  ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        with path.open("w") as fh:
+            for cc, _rr, _ll in rows:
+                if cc["case_id"] in done:
+                    fh.write(json.dumps(done[cc["case_id"]]) + "\n")
+        _UPLOAD.submit(lambda: s3.put_object(Bucket=BUCKET,
+                       Key=_faith_key(version, coder), Body=path.read_bytes()))
+        st["i"] += 1
+        render()
+
+    def on_back(_):
+        st["i"] = max(0, st["i"] - 1)
+        render()
+
+    subm.on_click(on_submit)
+    back.on_click(on_back)
+    render()
+
+
+def faithfulness_report(version="v1"):
+    recs = load_faith(version)
+    if not recs:
+        print(f"no faithfulness records under case_faithfulness/{version}/")
+        return {}
+    by = Counter(r["faithfulness"] for r in recs)
+    n = len(recs)
+    print(f"== {n} PhyJudge rationale cases ==")
+    for k in FAITH_KEYS:
+        print(f"  {k:12s} {by[k]:3d}  ({by[k]/n:.0%})")
+    unf = [r for r in recs if r["faithfulness"] in ("unfaithful", "partial")]
+    if unf:
+        print("\n== unfaithful / partial (report these) ==")
+        for r in unf:
+            print(f"  {r['case_id']}  coded={r.get('coded_failure_mode')}  "
+                  f"-> {r['faithfulness']}")
+            if r.get("note"):
+                print(f"     {r['note'][:100]}")
+    return {"n": n, "dist": dict(by),
+            "unfaithful_rate": (by["unfaithful"] + by["partial"]) / n}
+
+
 def adjudicate(version="v1", adjudicator="adj"):
     """Third pass over disagreements only."""
     import ipywidgets as W
