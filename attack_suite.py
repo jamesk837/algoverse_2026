@@ -352,6 +352,83 @@ def process_clip(dataset, source_key, all_attacks):
     return source_key
 
 
+def attack_filenames(attacks):
+    """Attack keys -> the variant filenames they render as."""
+    return {out_key_for("_", a, "_/x.mp4").rsplit("/", 1)[-1][:-4] for a in attacks}
+
+
+def rendered_stems(dataset, require=None):
+    """Stems that already have at least one of `require` rendered.
+
+    This is what "the curated corpus" means operationally: the clips the 2x2
+    attacks were actually rendered for, which is the set the judges scored.
+    `datasets/videophy2_test/` lists 1638 clips and only ~450 of them are in
+    the experiment -- the rest still have a `clean` (it IS the source object),
+    so nothing downstream filters them out on its own.
+
+    Deliberately NOT the cheap Delimiter="/" directory check that
+    judge_harness.clips_with_attacks uses. Once `identity` has been rendered
+    for a clip, that clip HAS a directory, so a directory check would call it
+    curated on the strength of the control alone -- and on a rerun would keep
+    every clip it wrongly rendered the first time. This does the full object
+    LIST and requires a real 2x2 attack.
+    """
+    require = attack_filenames(require or ATTACKS_2X2)
+    prefix = f"attacks/{dataset}/"
+    stems, paginator = set(), _ensure_s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rest = obj["Key"][len(prefix):]
+            if "/" not in rest:
+                continue
+            stem, fname = rest.split("/", 1)
+            if fname.endswith(".mp4") and fname[:-4] in require:
+                stems.add(stem)
+    return stems
+
+
+def stray_controls(dataset, delete=False):
+    """Control renders on clips that are not in the curated corpus.
+
+    Rendering the control before the corpus filter existed leaves
+    `identity.mp4` under stems that carry no 2x2 attack. They are not merely
+    wasted encodes: run_judges(variants=["identity"]) filters on that exact
+    render being present, so each one would pull a clip the experiment never
+    included into the judge run at 26 generations a time.
+
+    Lists by default. Pass delete=True to remove them.
+    """
+    curated = rendered_stems(dataset)
+    prefix = f"attacks/{dataset}/"
+    controls = attack_filenames(CONTROL_ATTACKS)
+    s3c, strays = _ensure_s3(), []
+    for page in s3c.get_paginator("list_objects_v2").paginate(Bucket=BUCKET,
+                                                              Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rest = obj["Key"][len(prefix):]
+            if "/" not in rest:
+                continue
+            stem, fname = rest.split("/", 1)
+            if (fname.endswith(".mp4") and fname[:-4] in controls
+                    and stem not in curated):
+                strays.append(obj["Key"])
+
+    print(f"{dataset}: {len(curated)} curated stems, "
+          f"{len(strays)} stray control render(s)")
+    for k in strays[:10]:
+        print(f"  {k}")
+    if len(strays) > 10:
+        print(f"  ... and {len(strays) - 10} more")
+    if strays and not delete:
+        print("  pass delete=True to remove them")
+    for i in range(0, len(strays) if delete else 0, 1000):
+        s3c.delete_objects(Bucket=BUCKET, Delete={
+            "Objects": [{"Key": k} for k in strays[i:i + 1000]]})
+    if delete and strays:
+        print(f"  deleted {len(strays)}")
+    return strays
+
+
 def attack_set(name="2x2"):
     """`2x2` is the taxonomy's nine; `control` is the codec control alone.
 
@@ -369,7 +446,17 @@ def attack_set(name="2x2"):
 
 
 def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS,
-              attacks="2x2"):
+              attacks="2x2", only_rendered=None):
+    """only_rendered restricts the run to the curated corpus -- the stems that
+    already carry a 2x2 attack, i.e. the clips the judges were actually run on.
+
+    It defaults to ON when rendering only controls and OFF otherwise, because
+    the two cases want opposite answers: the 2x2 pass CREATES the corpus and
+    must see every source clip, while a control has nothing to control for on
+    a clip the experiment never included. `datasets/videophy2_test/` lists
+    1638 clips against ~450 curated, so getting this wrong renders 3.6x more
+    than needed and then feeds them to the judges at 26 generations each.
+    """
     if dataset not in DATASET_PREFIXES:
         raise ValueError(f"dataset must be one of {list(DATASET_PREFIXES)}")
     source_prefix = DATASET_PREFIXES[dataset]
@@ -381,6 +468,24 @@ def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS,
 
     all_attacks = attack_set(attacks) if isinstance(attacks, str) else list(attacks)
     print(f"attacks: {', '.join(all_attacks)}")
+
+    if only_rendered is None:
+        only_rendered = set(all_attacks) <= set(CONTROL_ATTACKS)
+        print(f"only_rendered={only_rendered} (auto: "
+              + ("controls only, so restricting to the curated corpus"
+                 if only_rendered else
+                 "a 2x2 pass creates the corpus, so using every source clip")
+              + "; pass only_rendered= to override)")
+    if only_rendered:
+        curated = rendered_stems(dataset)
+        before = len(source_keys)
+        source_keys = [k for k in source_keys if Path(k).stem in curated]
+        print(f"{len(source_keys)} of {before} source clips are in the "
+              f"curated corpus ({before - len(source_keys)} skipped)")
+        if not source_keys:
+            print(f"nothing under attacks/{dataset}/ carries a 2x2 attack - "
+                  "render those first")
+            return
 
     already_done = sum(clip_fully_done(dataset, k, all_attacks) for k in source_keys)
     todo = [k for k in source_keys if not clip_fully_done(dataset, k, all_attacks)]
