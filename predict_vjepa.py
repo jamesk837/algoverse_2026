@@ -99,20 +99,35 @@ def in_notebook():
 
 # --------------------------------------------------------------- selection
 
-def variants_for(entry, doc):
-    """The doc's corpus: train contributes CLEAN ONLY, held-out contributes
-    clean plus all nine variants.
+def has_train_split(doc):
+    """A split doc carries train/val/cal; a benchmark doc built by
+    embed_vjepa.load_doc() labels every clip with the dataset name instead."""
+    return any(e["split"] == "train" for e in doc["clips"].values())
+
+
+def variants_for(entry, doc, has_train=None):
+    """train contributes CLEAN ONLY, everything else contributes clean plus all
+    nine variants.
 
     Deliberately not embed_vjepa.variants_needed(), which gives a train clip
     its two assigned superficial perturbations. Those exist to train the probe;
     here train clips have exactly one job -- defining the spike threshold from
     a pile of normal clips nothing else in the analysis touches.
+
+    On a benchmark corpus there is no train/val/cal, so every clip carries the
+    full set. Without that branch a benchmark doc silently yields nothing --
+    it would run to completion having computed zero errors.
     """
+    if has_train is None:
+        has_train = has_train_split(doc)
+    full = (["clean"] + list(doc["superficial_variants"])
+            + list(E.temporal_variants(doc)))
+    if not has_train:
+        return full
     if entry["split"] == "train":
         return ["clean"]
     if entry["split"] in E.held_out_splits(doc):
-        return (["clean"] + list(doc["superficial_variants"])
-                + list(E.temporal_variants(doc)))
+        return full
     return []
 
 
@@ -120,9 +135,10 @@ def plan(doc, limit=None, workers=E.CACHE_READ_WORKERS):
     """-> [(stem, [missing variants])], resumable per (clip, variant)."""
     cached = cached_stems()
     todo, have, n_want = [], 0, 0
+    has_train = has_train_split(doc)
     stems = sorted(doc["clips"])
     for stem in stems:
-        want = variants_for(doc["clips"][stem], doc)
+        want = variants_for(doc["clips"][stem], doc, has_train)
         if not want:
             continue
         n_want += len(want)
@@ -380,7 +396,7 @@ def summarise(err, threshold=None):
 # --------------------------------------------------------------------- run
 
 def run(limit=None, device=None, dry_run=False, context=CONTEXT,
-        store_tokens=True, doc=None):
+        store_tokens=True, doc=None, models=None):
     import torch
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -392,7 +408,7 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
     if dry_run or not todo:
         return {"todo": len(todo)}
 
-    processor, encoder, predictor = load_models(device)
+    processor, encoder, predictor = models or load_models(device)
 
     t0 = time.perf_counter()
     done, failed = 0, 0
@@ -444,6 +460,58 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
     if failed:
         print("  a clean exit is not a clean run -- grep FAILED above")
     return {"computed": done, "failed": failed}
+
+
+def run_all(datasets="train", device=None, dry_run=False, context=CONTEXT,
+            store_tokens=True, limit=None):
+    """Several corpora back to back with the models loaded once.
+
+    `datasets` takes embed_vjepa's spelling: "train" is the probe's own split
+    (the doc's Step 10 corpus), "all" adds the three benchmark corpora, or name
+    them individually. A corpus that blows up is reported and the run
+    continues, and everything stays resumable per (clip, variant).
+
+    Worth being explicit about what the benchmark corpora are FOR: the doc
+    scopes Step 10 to the split corpus, because that is where a predictor-vs-PC
+    probe comparison is possible at all. Running the benchmark corpora collects
+    data the doc does not ask for -- cheap to gather now, expensive to come
+    back for -- but the doc's caveat still binds when it comes to using it:
+    predictor statistics are "compared qualitatively and statistically with the
+    PC probe but not by directly comparing their raw numerical scales", so
+    these do not slot into dJ - dV.
+    """
+    import torch
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    names = E.expand_datasets(datasets)
+    label = ", ".join(n or "videophy2_train" for n in names)
+    print(f"predictor over {len(names)} corpora: {label}")
+
+    models = None if dry_run else load_models(device)
+
+    summary = []
+    for i, name in enumerate(names, 1):
+        title = name or "videophy2_train"
+        print(f"\n{'#' * 70}\n# [{i}/{len(names)}] {title}\n{'#' * 70}")
+        try:
+            doc = E.load_split() if name is None else E.load_doc(name)
+            got = run(limit=limit, device=device, dry_run=dry_run,
+                      context=context, store_tokens=store_tokens, doc=doc,
+                      models=models)
+            summary.append((title, got.get("computed", 0),
+                            got.get("failed", 0), None))
+        except Exception as e:
+            print(f"CORPUS FAILED {title}: {type(e).__name__}: {e}")
+            summary.append((title, 0, 0, f"{type(e).__name__}: {e}"))
+
+    print(f"\n{'=' * 70}\nsummary")
+    print(f"  {'corpus':<30} {'computed':>9} {'failed':>7}")
+    for title, done, failed, err in summary:
+        print(f"  {title:<30} {done:>9} {failed:>7}"
+              + (f"   ERROR {err}" if err else ""))
+    if any(f for _, _, f, _ in summary) or any(e for *_, e in summary):
+        print("  a clean exit is not a clean run: check the lines above")
+    return summary
 
 
 def verify(device=None, n_clips=3, context=CONTEXT):
@@ -699,13 +767,21 @@ def selftest():
            "held_out_splits": ["val", "cal"], "val_temporal_variants":
            ["shuffle", "reverse", "freeze"]}
     check("train contributes clean only",
-          variants_for({"split": "train"}, doc) == ["clean"])
-    v = variants_for({"split": "val"}, doc)
+          variants_for({"split": "train"}, doc, has_train=True) == ["clean"])
+    v = variants_for({"split": "val"}, doc, has_train=True)
     check("held-out contributes clean plus every variant", len(v) == 6, str(len(v)))
     check("held-out includes the temporal variants",
           set(TEMPORAL_VARIANTS) <= set(v))
-    check("an unknown split contributes nothing",
-          variants_for({"split": "other"}, doc) == [])
+    check("an unknown split of a SPLIT doc contributes nothing",
+          variants_for({"split": "other"}, doc, has_train=True) == [])
+    # the branch that would otherwise make a benchmark run silently compute
+    # nothing: those clips carry split == the dataset name
+    check("a benchmark clip gets the full variant set",
+          len(variants_for({"split": "videophy2_test"}, doc,
+                           has_train=False)) == 6)
+    check("has_train_split distinguishes the two doc shapes",
+          has_train_split({"clips": {"a": {"split": "train"}}})
+          and not has_train_split({"clips": {"a": {"split": "videophy2_test"}}}))
 
     print("-" * 68)
     print("selftest OK" if ok else "selftest FAILED")
@@ -727,6 +803,9 @@ if __name__ == "__main__" and not in_notebook():
                     help="skip the per-token errors (~35 KB/clip)")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--datasets", nargs="+", default=["train"],
+                    help="train (the doc's Step 10 corpus) | all | a "
+                         "benchmark corpus name")
     a = ap.parse_args()
 
     if a.selftest:
@@ -736,5 +815,6 @@ if __name__ == "__main__" and not in_notebook():
     if a.report:
         report(stat=a.stat, push_to_s3=not a.no_push)
     else:
-        run(limit=a.limit, device=a.device, dry_run=a.dry_run,
-            context=a.context, store_tokens=not a.no_tokens)
+        run_all(datasets=a.datasets, device=a.device, dry_run=a.dry_run,
+                context=a.context, store_tokens=not a.no_tokens,
+                limit=a.limit)
