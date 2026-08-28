@@ -458,8 +458,8 @@ def check_pass2(quick=False, top=8):
     for ds, target in PASS2_TARGETS.items():
         by_stem = {}
         for pre in PASS2_PREFIXES:
-            keys = [k for k in _list("%s/%s/%s/" % (pre, judge, ds))
-                    if k.endswith(".json")]
+            k_all, _ = _list("%s/%s/%s/" % (pre, judge, ds))
+            keys = [k for k in k_all if k.endswith(".json")]
             for rec in _get_many(keys):
                 if not rec:
                     continue
