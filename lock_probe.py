@@ -35,8 +35,10 @@ import numpy as np
 
 # Everything this file borrows from train_probe. Bound by _adopt() below.
 _NEEDED = ("BUCKET", "PROBE_PREFIX", "PACK_PREFIXES", "PACK_KIND", "EMBED_DIM",
-           "N_TEMPORAL", "N_THRESH", "build_eval", "expected_pc", "load_pack",
-           "make_model", "train", "_ensure_s3", "_rankdata", "_spearman")
+           "N_TEMPORAL", "N_THRESH", "TEMPORAL_VARIANTS", "build_eval",
+           "concat_packs", "expected_pc", "group_by_stem", "load_pack",
+           "make_model", "train", "variant_kind", "_boot_ci", "_ensure_s3",
+           "_rankdata", "_spearman")
 
 
 def _adopt():
