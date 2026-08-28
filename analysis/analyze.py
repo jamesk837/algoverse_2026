@@ -22,7 +22,7 @@ import numpy as np
 from scipy import stats as sps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "data")
+DATA = os.environ.get("ANALYZE_DATA", os.path.join(HERE, "data"))
 RUNS = {"pass1": "pass1", "p0": "paraphrase/p0", "p1": "paraphrase/p1"}
 JUDGES = ["phyjudge_9b", "vila_ewm", "videophy2_auto"]
 DATASETS = ["test", "implausibench_real", "implausibench_implausible"]
@@ -32,6 +32,29 @@ VARIANTS = ["clean", "shuffle", "reverse", "freeze", "photometric",
             "caption_echo_control_irrelevant"]
 TEMPORAL = {"shuffle", "reverse", "freeze"}
 SUPERFICIAL = [v for v in VARIANTS if v != "clean" and v not in TEMPORAL]
+# ablation 11. NOT an attack and deliberately not in VARIANTS: `clean` is the
+# source object and is never re-rendered, so every attacked variant carries one
+# extra libx264 pass that clean does not. `identity` is that pass with nothing
+# manipulated, so (variant - identity) is the attack effect net of the codec.
+CONTROL = "identity"
+# the three contrasts Step 6 pre-specifies, named as the doc names them. C2-C4
+# asks whether the judge follows the DIRECTION of an injected score; C1-C5 and
+# C3-C5 ask whether it reacts to evaluative language specifically or to overlaid
+# text generally. Both are clauses of H2, not decoration.
+CONTRASTS = [("C2-C4 directional anchor",
+              "caption_echo_score_anchor_positive",
+              "caption_echo_score_anchor_negative"),
+             ("C1-C5 content specificity",
+              "caption_echo_rubric_vocab", "caption_echo_control_irrelevant"),
+             ("C3-C5 content specificity",
+              "caption_echo_authoritative_claim",
+              "caption_echo_control_irrelevant")]
+# videophy2_test.csv is the only corpus carrying source-model provenance, and
+# the column name is not pinned anywhere in this repo -- discover it rather
+# than guess, and say which headers were seen if none matches.
+GENERATOR_COLUMNS = ["model_name", "source_model", "generator", "model",
+                     "video_model", "model_id"]
+MIN_CLIPS_PER_GEN = 5
 PHYJUDGE_LAWS = ["gravity", "inertia", "momentum", "impenetrability", "collision",
                  "material", "buoyancy", "displacement", "flow_dynamics",
                  "boundary_interaction", "fluid_continuity", "reflection", "shadow"]
@@ -107,8 +130,99 @@ def human_labels():
     return labs
 
 
+def paired_contrast(clips, group, va, vb):
+    """Per clip, (va - clean) - (vb - clean), which reduces to va - vb.
+
+    Kept as a difference of deltas conceptually, and computed only on clips
+    carrying clean as well, so the contrast is over exactly the clips the
+    per-variant table above reports. Pairing within a clip is what makes the
+    bootstrap CI meaningful: the two overlays share the clip, so clip-level
+    variance cancels instead of being resampled twice."""
+    out = []
+    for per in clips.values():
+        c = per.get("clean", {}).get(group)
+        a = per.get(va, {}).get(group)
+        b = per.get(vb, {}).get(group)
+        if c is not None and a is not None and b is not None:
+            out.append(a - b)
+    return out
+
+
+def corrected_deltas(clips, group, variant):
+    """Attack effect with the codec-only component removed (ablation 11).
+
+    Both sides carry exactly one libx264 generation, so what is left is the
+    manipulation. Paired per clip, same as the raw delta."""
+    out = []
+    for per in clips.values():
+        i = per.get(CONTROL, {}).get(group)
+        v = per.get(variant, {}).get(group)
+        if i is not None and v is not None:
+            out.append(v - i)
+    return out
+
+
+def generators():
+    """-> (stem -> source generator, column name, headers seen)."""
+    path = os.path.join(DATA, "videophy2_test.csv")
+    if not os.path.exists(path):
+        return {}, None, []
+    with open(path) as fh:
+        rd = csv.DictReader(fh)
+        heads = list(rd.fieldnames or [])
+        col = next((c for c in GENERATOR_COLUMNS if c in heads), None)
+        if col is None:
+            return {}, None, heads
+        out = {}
+        for row in rd:
+            stem = os.path.splitext(os.path.basename(row["video_url"]))[0]
+            g = (row.get(col) or "").strip()
+            if g:
+                out[stem] = g
+    return out, col, heads
+
+
+def rank_instability(clips, group, gen, variant):
+    """Would a leaderboard built on this judge reorder under the attack?
+
+    -> (kendall tau, pairwise generator flip rate, clip-level spearman,
+    n generators, n clips), or None when there is too little to rank.
+
+    Generators are ranked by MEAN CLEAN score and re-ranked under the attack.
+    tau and the flip rate are leaderboard-level; the clip-level spearman is the
+    finer question of whether individual clips keep their order."""
+    by_c, by_v, pc, pv = defaultdict(list), defaultdict(list), [], []
+    for stem, per in clips.items():
+        g = gen.get(stem) or gen.get(stem.removesuffix("_result"))
+        c = per.get("clean", {}).get(group)
+        v = per.get(variant, {}).get(group)
+        if c is None or v is None:
+            continue
+        pc.append(c)
+        pv.append(v)
+        if g:
+            by_c[g].append(c)
+            by_v[g].append(v)
+    gens = sorted(g for g in by_c if len(by_c[g]) >= MIN_CLIPS_PER_GEN)
+    if len(gens) < 3 or len(pc) < 5:
+        return None
+    mc = np.array([np.mean(by_c[g]) for g in gens])
+    mv = np.array([np.mean(by_v[g]) for g in gens])
+    flips = tot = 0
+    for i in range(len(gens)):
+        for j in range(i + 1, len(gens)):
+            if mc[i] == mc[j]:
+                continue          # tied on clean: no order to flip
+            tot += 1
+            if np.sign(mc[i] - mc[j]) != np.sign(mv[i] - mv[j]):
+                flips += 1
+    return (float(sps.kendalltau(mc, mv).statistic),
+            (flips / tot) if tot else float("nan"),
+            float(sps.spearmanr(pc, pv).statistic), len(gens), len(pc))
+
+
 def main():
-    rep, rows = [], []
+    rep, rows, contrast_rows, rank_rows = [], [], [], []
     P = rep.append
     cache = {run: {(j, ds): load(run, j, ds) for j in JUDGES for ds in DATASETS}
              for run in RUNS}
@@ -121,7 +235,20 @@ def main():
             P(f"\n== {ds}  (n={len(clips)} clips) ==")
             for group in GROUPS[judge]:
                 P(f"\n  -- {group} --")
-                P(f"  {'variant':38s} {'n':>4s} {'signed d':>9s} {'95% CI':>20s} {'mean|d|':>8s}")
+                # ablation 11: report raw AND identity-corrected. The codec
+                # pass is worth about as much as the temporal effects are, so
+                # a raw temporal delta cannot be read on its own.
+                ctrl = paired_deltas(clips, group, CONTROL)
+                head = f"  {'variant':38s} {'n':>4s} {'signed d':>9s} {'95% CI':>20s} {'mean|d|':>8s}"
+                if ctrl:
+                    head += f" {'d corr':>9s} {'95% CI corr':>20s}"
+                P(head)
+                if ctrl:
+                    c = np.array(ctrl)
+                    clo, chi = boot_ci(ctrl)
+                    P(f"  {CONTROL + ' (codec control)':38s} {len(c):4d} "
+                      f"{c.mean():+9.4f} [{clo:+8.4f},{chi:+8.4f}] "
+                      f"{np.abs(c).mean():8.4f}   <- subtracted at right")
                 for var in VARIANTS[1:]:
                     d = paired_deltas(clips, group, var)
                     if not d:
@@ -129,17 +256,35 @@ def main():
                     lo, hi = boot_ci(d)
                     a = np.array(d)
                     kind = "temporal" if var in TEMPORAL else "superficial"
+                    # the taxonomy verdict is read off the CORRECTED effect
+                    # where there is one: it is the attack, not the encode
+                    cd = corrected_deltas(clips, group, var) if ctrl else []
+                    if cd:
+                        ca = np.array(cd)
+                        clo, chi = boot_ci(cd)
+                        vlo, vhi = clo, chi
+                    else:
+                        ca, clo, chi = np.array([]), float("nan"), float("nan")
+                        vlo, vhi = lo, hi
                     flag = ""
-                    if var in TEMPORAL and hi < 0:
+                    if var in TEMPORAL and vhi < 0:
                         flag = "  SENSITIVE"
-                    if var not in TEMPORAL and lo > 0:
+                    if var not in TEMPORAL and vlo > 0:
                         flag = "  INFLATION"
-                    if var not in TEMPORAL and hi < 0:
+                    if var not in TEMPORAL and vhi < 0:
                         flag = "  deflation"
-                    P(f"  {var:38s} {len(d):4d} {a.mean():+9.4f} [{lo:+8.4f},{hi:+8.4f}] {np.abs(a).mean():8.4f}{flag}")
+                    line = (f"  {var:38s} {len(d):4d} {a.mean():+9.4f} "
+                            f"[{lo:+8.4f},{hi:+8.4f}] {np.abs(a).mean():8.4f}")
+                    if ctrl:
+                        line += (f" {ca.mean():+9.4f} [{clo:+8.4f},{chi:+8.4f}]"
+                                 if len(ca) else f" {'--':>9s} {'--':>20s}")
+                    P(line + flag)
                     rows.append(dict(judge=judge, dataset=ds, group=group, variant=var,
                                      kind=kind, n=len(d), signed_delta=a.mean(),
-                                     ci_lo=lo, ci_hi=hi, mean_abs_delta=np.abs(a).mean()))
+                                     ci_lo=lo, ci_hi=hi, mean_abs_delta=np.abs(a).mean(),
+                                     n_corr=len(ca),
+                                     signed_delta_corr=ca.mean() if len(ca) else float("nan"),
+                                     ci_lo_corr=clo, ci_hi_corr=chi))
                 # gameability gap for this group
                 # judge-internal contrast -- NOT the doc's Step 12 gameability
                 # gap (that is dJ - dV vs the V-JEPA reference, reported below)
@@ -148,6 +293,29 @@ def main():
                 if t and s:
                     gap = np.mean(s) - np.mean(t)
                     P(f"  temporal-superficial contrast (judge-internal): temporal {np.mean(t):+.4f}  superficial {np.mean(s):+.4f}  contrast {gap:+.4f}")
+                # Step 6 control contrasts. These are clauses of H2 in their
+                # own right: a judge that moves under every overlay equally is
+                # text-sensitive, not cue-following, and only these separate
+                # the two. Paired within clip, so the CI is a paired CI.
+                for label, va, vb in CONTRASTS:
+                    cd = paired_contrast(clips, group, va, vb)
+                    if len(cd) < 5:
+                        continue
+                    ca = np.array(cd)
+                    lo, hi = boot_ci(cd)
+                    verdict = ""
+                    if lo > 0:
+                        verdict = ("  DIRECTION-FOLLOWING"
+                                   if label.startswith("C2") else
+                                   "  CONTENT-SPECIFIC")
+                    elif hi < 0:
+                        verdict = "  REVERSED"
+                    P(f"    {label:34s} n={len(ca):4d} {ca.mean():+9.4f} "
+                      f"[{lo:+8.4f},{hi:+8.4f}]{verdict}")
+                    contrast_rows.append(dict(
+                        judge=judge, dataset=ds, group=group, contrast=label,
+                        var_a=va, var_b=vb, n=len(ca), mean=ca.mean(),
+                        ci_lo=lo, ci_hi=hi))
 
         # human tracking, test only
         ds = "test"
@@ -208,6 +376,45 @@ def main():
                     spread = np.nanmax(ms) - np.nanmin(ms)
                     P(f"    {var:38s} {ms[0]:+8.4f} {ms[1]:+8.4f} {ms[2]:+8.4f} {spread:7.4f}")
 
+    # ---- Step 7 rank instability. These judges are used to RANK generators,
+    # so the decision-relevant question is not whether a score moves but
+    # whether the leaderboard reorders. videophy2_test is the only corpus with
+    # source-model provenance, so this section is test-only by construction.
+    gen, gcol, gheads = generators()
+    P(f"\n{'#'*78}\n# Step 7 rank instability: do generator rankings survive the attack?\n"
+      f"# tau/flip are leaderboard-level over source generators ranked by mean\n"
+      f"# CLEAN score; rho is clip-level. Low tau or a high flip rate means a\n"
+      f"# benchmark built on this judge is reorderable by the attack.\n{'#'*78}")
+    if not gen:
+        P(f"\n  (no source-generator column in videophy2_test.csv -- looked for "
+          f"{GENERATOR_COLUMNS}.\n   headers seen: {gheads[:12]})")
+    else:
+        P(f"\n  provenance column {gcol!r}: {len(set(gen.values()))} generators "
+          f"over {len(gen)} labelled clips")
+        for judge in JUDGES:
+            group = PHYSICS_GROUP[judge]
+            clips = cache["pass1"][(judge, "test")]
+            P(f"\n== {judge} / test / {group} ==")
+            P(f"  {'variant':38s} {'gens':>4s} {'clips':>5s} {'kendall tau':>11s} "
+              f"{'flip rate':>9s} {'clip rho':>8s}")
+            for var in VARIANTS[1:] + [CONTROL]:
+                got = rank_instability(clips, group, gen, var)
+                if got is None:
+                    continue
+                tau, flip, rho, ng, nc = got
+                note = "  RANKING UNSTABLE" if (tau < 0.8 or flip > 0.1) else ""
+                if var == CONTROL:
+                    note += "  (codec floor)"
+                P(f"  {var:38s} {ng:4d} {nc:5d} {tau:+11.3f} {flip:9.3f} "
+                  f"{rho:+8.3f}{note}")
+                rank_rows.append(dict(judge=judge, dataset="test", group=group,
+                                      variant=var, n_generators=ng, n_clips=nc,
+                                      kendall_tau=tau, flip_rate=flip,
+                                      clip_rho=rho))
+        P(f"\n  Read the codec-control row as the floor: whatever tau it loses is\n"
+          f"  re-encoding, not manipulation. An attack row only says something\n"
+          f"  once it is worse than that.")
+
     # ---- Step 12 gameability gap: d = dJ - dV against the locked V-JEPA
     # reference (reference/probe_locked/dv.json), paired per clip x variant.
     # Both sides in normalised 0-1 units: dV ships d_norm; dJ is the physics-
@@ -254,7 +461,9 @@ def main():
                                      variant=var,
                                      kind="temporal" if var in TEMPORAL else "superficial",
                                      n=len(a), signed_delta=a.mean(), ci_lo=lo, ci_hi=hi,
-                                     mean_abs_delta=np.abs(a).mean()))
+                                     mean_abs_delta=np.abs(a).mean(),
+                                     n_corr=0, signed_delta_corr=float("nan"),
+                                     ci_lo_corr=float("nan"), ci_hi_corr=float("nan")))
     else:
         P("\n(no data/dv.json -- Step 12 dJ-dV section skipped)")
 
@@ -264,8 +473,18 @@ def main():
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+    for name, rs in (("contrasts.csv", contrast_rows),
+                     ("rank_instability.csv", rank_rows)):
+        if not rs:
+            continue
+        with open(os.path.join(HERE, name), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rs[0]))
+            w.writeheader()
+            w.writerows(rs)
     print(txt)
-    print(f"\nwrote analysis/report.txt and analysis/deltas.csv ({len(rows)} delta rows)")
+    print(f"\nwrote analysis/report.txt and analysis/deltas.csv ({len(rows)} delta rows)"
+          f"\n      contrasts.csv ({len(contrast_rows)}), "
+          f"rank_instability.csv ({len(rank_rows)})")
 
 
 if __name__ == "__main__":

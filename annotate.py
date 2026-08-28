@@ -1192,6 +1192,13 @@ def report(version="v1", raters=None, n_boot=2000, vjepa_deltas=None):
     print("== %d annotations, %d raters (%s), %d clips ==" %
           (len(recs), len(all_raters), ", ".join(all_raters),
            len({r["stem"] for r in recs})))
+    if len(all_raters) == 1:
+        print("  SINGLE RATER. Inter-rater agreement is not thin here, it is\n"
+              "  UNDEFINED: Krippendorff's alpha and Cohen's kappa both need\n"
+              "  >=2 raters. The reliability evidence is (a) intra-rater\n"
+              "  consistency on the clean clip, which recurs once per variant,\n"
+              "  and (b) the check against VideoPhy-2's published PC below.\n"
+              "  Report both, and report every rate as one rater's judgement.")
 
     by_var = defaultdict(list)
     for r in recs:
@@ -1262,6 +1269,19 @@ def agreement(version="v1", recs=None, raters=None):
     by_item = defaultdict(dict)
     for r in recs:
         by_item[r["item_id"]][r["rater"]] = r
+
+    # One rater is not a thin overlap, and the `overlap` advice below would
+    # send someone to fix a setting that is not the cause. Agreement between
+    # raters is undefined at n=1; _intra_rater and _vs_published carry the
+    # reliability evidence instead, and report() prints both.
+    seen = {r["rater"] for r in recs}
+    if len(seen) < 2:
+        print("\n== inter-rater agreement, per attack ==")
+        print("  not computable: %d rater (%s). Agreement BETWEEN raters needs "
+              "at least two." % (len(seen), ", ".join(sorted(seen)) or "none"))
+        print("  read instead: intra-rater consistency on the repeated clean "
+              "clip, and the comparison against VideoPhy-2's published PC.")
+        return {}
 
     print("\n== inter-rater agreement, per attack (shared items only) ==")
     print("  %-34s %5s %6s %7s %8s %8s"
@@ -1415,9 +1435,22 @@ def _intra_rater(recs):
         return
     spread = [max(v) - min(v) for v in groups]
     exact = float(np.mean([len(set(v)) == 1 for v in groups]))
+    wide = float(np.mean([s >= 2 for s in spread]))
+    n_raters = len({k[0] for k in per})
     print("\n== intra-rater consistency on the repeated clean clip ==")
-    print("  %d (rater, clip) groups, mean PC range %.2f, all-identical %.0f%%"
-          % (len(groups), float(np.mean(spread)), 100 * exact))
+    print("  %d (rater, clip) groups, mean PC range %.2f, all-identical %.0f%%,"
+          " range>=2 on %.0f%%"
+          % (len(groups), float(np.mean(spread)), 100 * exact, 100 * wide))
+    if n_raters < 2:
+        # with one rater this is the ONLY reliability estimate in the study, so
+        # it is worth stating what it does and does not cover: it bounds the
+        # rater's own noise on an unchanged clip, which caps every delta
+        # measured against that clip, but says nothing about whether the rubric
+        # would transfer to a second person
+        print("  The study's only reliability estimate (single rater). It "
+              "bounds the rater's\n  noise on an UNCHANGED clip, which caps "
+              "every attack delta measured\n  against it -- it does NOT show "
+              "the rubric transfers to another person.")
 
 
 def compare_to_vjepa(vjepa_deltas, version="v1", human=None, tol=0.05):
