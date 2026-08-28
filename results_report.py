@@ -730,11 +730,123 @@ def section_table1_and_verdicts(step9_stats, temporal_idx):
 
 
 # ======================================================================
+# lean Step 6 / 7 / 8  (compact, from analyze.py's CSVs + a recompute)
+# ======================================================================
+
+PHYS_GROUP = {"phyjudge_9b": "laws13", "vila_ewm": "physical_laws_bool",
+              "videophy2_auto": "PC"}
+_PHYS_LAWS = ("gravity", "inertia", "momentum", "impenetrability", "collision",
+              "material", "buoyancy", "displacement", "flow_dynamics",
+              "boundary_interaction", "fluid_continuity", "reflection", "shadow")
+PHYS_GROUP_CALL = {
+    "phyjudge_9b": lambda c: c in _PHYS_LAWS,
+    "vila_ewm": lambda c: c.startswith("physical_laws_"),
+    "videophy2_auto": lambda c: c == "PC",
+}
+_PHYS_SPAN = {"phyjudge_9b": 4.0, "vila_ewm": 1.0, "videophy2_auto": 4.0}
+_PHYS_LO = {"phyjudge_9b": 1.0, "vila_ewm": 0.0, "videophy2_auto": 1.0}
+
+
+def _normphys(judge, x):
+    return (x - _PHYS_LO[judge]) / _PHYS_SPAN[judge]
+
+
+def _read_csv(name):
+    import csv
+    for cand in (os.path.join("analysis", name), name):
+        if os.path.exists(cand):
+            with open(cand) as fh:
+                return list(csv.DictReader(fh))
+    return []
+
+
+def _lean_step6_7(ds="test"):
+    L = [f"## Step 6 - judge attack response dJ ({ds}, physics group, [95% CI])\n"]
+    d = _read_csv("deltas.csv")
+    for judge in JUDGES:
+        rows = [r for r in d if r["judge"] == judge and r["dataset"] == ds
+                and r["group"] == PHYS_GROUP[judge]]
+        if not rows:
+            continue
+        by = {r["variant"]: r for r in rows}
+        L.append(f"**{judge}**")
+        L.append("| attack | dJ | 95% CI | flag |")
+        L.append("|---|---|---|---|")
+        for v in list(TEMPORAL) + SUPERFICIAL:
+            r = by.get(v)
+            if not r:
+                continue
+            lo, hi = float(r["ci_lo"]), float(r["ci_hi"])
+            flag = ("SENSITIVE" if v in TEMPORAL and hi < 0 else
+                    "INFLATION" if v in SUPERFICIAL and lo > 0 else
+                    "deflation" if v in SUPERFICIAL and hi < 0 else "")
+            L.append(f"| {v} | {float(r['signed_delta']):+.3f} | "
+                     f"[{lo:+.3f}, {hi:+.3f}] | {flag} |")
+        L.append("")
+    c = _read_csv("contrasts.csv")
+    if c:
+        L.append("### control contrasts (paired, [95% CI])\n")
+        L.append("| judge | contrast | mean | 95% CI |")
+        L.append("|---|---|---|---|")
+        for r in c:
+            if r["dataset"] != ds:
+                continue
+            L.append(f"| {r['judge']} | {r['contrast']} | {float(r['mean']):+.3f} | "
+                     f"[{float(r['ci_lo']):+.3f}, {float(r['ci_hi']):+.3f}] |")
+        L.append("")
+    ri = _read_csv("rank_instability.csv")
+    if ri:
+        L.append("## Step 7 - generator rank instability (test, worst attack per judge)\n")
+        L.append("| judge | worst variant | Kendall tau | flip rate | clip rho |")
+        L.append("|---|---|---|---|---|")
+        for judge in JUDGES:
+            jr = [r for r in ri if r["judge"] == judge and r["variant"] != "identity"]
+            if not jr:
+                continue
+            w = min(jr, key=lambda r: float(r["kendall_tau"]))
+            L.append(f"| {judge} | {w['variant']} | {float(w['kendall_tau']):+.3f} | "
+                     f"{float(w['flip_rate']):.2f} | {float(w['clip_rho']):+.3f} |")
+        L.append("")
+    return "\n".join(L)
+
+
+def _step8_alignment():
+    L = ["## Step 8 - clean judge vs human PC (VideoPhy-2 test)\n",
+         "| judge | n | MAE | Spearman |", "|---|---|---|---|"]
+    labs = human_labels()
+    stem_scores = {}
+    for judge in JUDGES:
+        h, m, sc = [], [], {}
+        for stem, pv in load_pass(PASS1, judge, "test", PHYS_GROUP_CALL[judge]).items():
+            lab = _lab(labs, stem)
+            if lab and "clean" in pv:
+                h.append((lab[0] - 1) / 4.0)
+                m.append(_normphys(judge, pv["clean"]))
+                sc[stem.removesuffix("_result")] = _normphys(judge, pv["clean"])
+        stem_scores[judge] = sc
+        if len(h) >= 5:
+            L.append(f"| {judge} | {len(h)} | {mae(h, m):.3f} | {spearman(h, m):+.3f} |")
+    L.append("\n### judge x judge Spearman (clean, shared test clips)\n")
+    L.append("| pair | rho | n |")
+    L.append("|---|---|---|")
+    js = list(JUDGES)
+    for i in range(len(js)):
+        for k in range(i + 1, len(js)):
+            common = set(stem_scores[js[i]]) & set(stem_scores[js[k]])
+            if len(common) < 5:
+                continue
+            x = [stem_scores[js[i]][cc] for cc in common]
+            y = [stem_scores[js[k]][cc] for cc in common]
+            L.append(f"| {js[i]} vs {js[k]} | {spearman(x, y):+.3f} | {len(common)} |")
+    return "\n".join(L) + "\n"
+
+
+# ======================================================================
 # build
 # ======================================================================
 
 def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
-          annot_version="v1", out="RESULTS.md"):
+          annot_version="v1", out="RESULTS.md", lean=True):
     t0 = time.time()
     parts = [f"# Consolidated results\n\n_generated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}_\n"]
 
@@ -769,8 +881,15 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     parts.append(s12_txt)
     parts.append(s13_txt)
 
-    parts.append("## Steps 6, 7, 8, ablations 10 & 11 — analysis/analyze.py\n\n"
-                 "```\n" + analyze_txt.rstrip() + "\n```\n")
+    if lean:
+        parts.append(_lean_step6_7())
+        parts.append(_step8_alignment())
+        parts.append("\n_per-dataset / pooled / compression / prompt-robustness "
+                     "(ablation 10) / identity-corrected (ablation 11) numbers are in "
+                     "analysis/deltas.csv, contrasts.csv and report.txt._\n")
+    else:
+        parts.append("## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
+                     "```\n" + analyze_txt.rstrip() + "\n```\n")
 
     doc = "\n".join(parts)
     Path(out).write_text(doc, encoding="utf-8")
