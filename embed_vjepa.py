@@ -360,19 +360,53 @@ def fmt_secs(s):
     return f"{s}s"
 
 
-def read_clip(path):
-    """Decode sequentially and return BGR frames; embed() converts to RGB."""
+def read_clip(path, k=None):
+    """Return the k sampled BGR frames; embed() converts to RGB.
+
+    Peak memory is k frames, not the whole clip. The previous version held
+    every decoded frame: ImplausiBench carries a 242 MB clip whose full decode
+    is ~30 GB, which OOM-killed a 32 GiB box three times in a row (2026-08-28)
+    at the same clip, with no traceback because SIGKILL leaves none.
+
+    The frames returned are EXACTLY the ones the whole-clip version handed to
+    frame_indices(). The count still comes from a sequential decode rather than
+    CAP_PROP_FRAME_COUNT, which lies on re-encoded files, and the indices come
+    from the same linspace -- so nothing about frame selection moves and the
+    caches stay comparable. Callers need no change either: embed() and
+    predict_vjepa._prep() both re-run frame_indices() on what they are given,
+    and sampling k from k is the identity.
+
+    The cost is decoding the file twice. The first pass is grab()-only, which
+    skips retrieving and converting pixel data, and it buys the frame count
+    that the second pass needs before it can know which frames to keep."""
+    k = NUM_FRAMES if k is None else k
     cap = cv2.VideoCapture(str(path))
-    frames = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(frame)
+    n = 0
+    while cap.grab():          # decode-minimal: no pixel data is retrieved
+        n += 1
     cap.release()
-    if not frames:
+    if n == 0:
         raise RuntimeError(f"decoded 0 frames from {path}")
-    return frames
+
+    want = frame_indices(n, k)
+    need = sorted({int(i) for i in want})      # n < k repeats indices
+    cap = cv2.VideoCapture(str(path))
+    got, pos, j = {}, 0, 0
+    while j < len(need):
+        if not cap.grab():
+            break
+        if pos == need[j]:
+            ok, frame = cap.retrieve()
+            if not ok:
+                break
+            got[pos] = frame
+            j += 1
+        pos += 1
+    cap.release()
+    if len(got) != len(need):
+        raise RuntimeError(f"read {len(got)} of {len(need)} sampled frames "
+                           f"from {path} ({n} frames counted)")
+    return [got[int(i)] for i in want]
 
 
 def frame_indices(n_frames, k=NUM_FRAMES):
