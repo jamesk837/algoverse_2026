@@ -130,6 +130,10 @@ ZERO_OK = {("vila_ewm", "instruction")}
 # ---- pass 2 -------------------------------------------------------------
 
 PASS2_PREFIX = "results/pass2"
+# the caption-echo pass-2 variants were written under a sibling prefix; a clip's
+# record is split across the two, one carrying clean+shuffle, the other the
+# caption_echo variants. check_pass2 merges runs by stem across both.
+PASS2_PREFIXES = ["results/pass2", "results/pass2_captions"]
 PASS2_JUDGE = "phyjudge_9b"
 PASS2_VARIANTS = ["clean", "shuffle", "caption_echo_control_irrelevant",
                   "caption_echo_score_anchor_positive"]
@@ -444,16 +448,25 @@ def check_pass2(quick=False, top=8):
     print("=" * 78)
     judge = PASS2_JUDGE
 
-    for other in ("vila_ewm", "videophy2_auto"):
-        k, _ = _list("%s/%s/" % (PASS2_PREFIX, other))
-        if k:
-            print("  note: %d stray %s records under %s/ (early attempt, not "
-                  "part of the run -- ignored)" % (len(k), other, PASS2_PREFIX))
+    for pre in PASS2_PREFIXES:
+        for other in ("vila_ewm", "videophy2_auto"):
+            k, _ = _list("%s/%s/" % (pre, other))
+            if k:
+                print("  note: %d stray %s records under %s/ (early attempt, "
+                      "ignored)" % (len(k), other, pre))
 
     for ds, target in PASS2_TARGETS.items():
-        keys, _ = _list("%s/%s/%s/" % (PASS2_PREFIX, judge, ds))
-        keys = [k for k in keys if k.endswith(".json")]
-        recs = [r for r in _get_many(keys) if r]
+        by_stem = {}
+        for pre in PASS2_PREFIXES:
+            keys = [k for k in _list("%s/%s/%s/" % (pre, judge, ds))
+                    if k.endswith(".json")]
+            for rec in _get_many(keys):
+                if not rec:
+                    continue
+                stem = rec.get("clip", rec.get("source_key"))
+                tgt = by_stem.setdefault(stem, {"clip": stem, "runs": {}})
+                tgt["runs"].update(rec.get("runs", {}))
+        recs = list(by_stem.values())
         n = len(recs)
 
         var_seen = Counter()

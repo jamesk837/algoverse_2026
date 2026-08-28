@@ -463,11 +463,39 @@ def section_step9_5():
                  "run `train_probe.py --ablation`._\n")
 
     # (2) clean-only vs nuisance-invariant
-    L.append("\n### (2) clean-only PC vs nuisance-invariant training\n")
-    L.append("_Needs one extra run: `train_probe.py --lambda-cons 0 --name "
-             "probe_t32_cleanonly` (and the nuisance run is the default probe). "
-             "Compare clean val MAE and the superficial dV of each. Not "
-             "auto-collected -- paste both `print_variant_table` blocks here._\n")
+    L.append("\n### (2) clean-only (lambda_cons=0) vs nuisance-invariant "
+             "(lambda_cons>0) training\n")
+    ab92 = {}
+    try:
+        import torch
+        for nm in ("probe_ab92_nuisance", "probe_ab92_cleanonly"):
+            key = f"probes/{nm}.pt"
+            if not _exists(key):
+                continue
+            ck = torch.load(io.BytesIO(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()),
+                            map_location="cpu", weights_only=False)
+            vm = ck.get("val") or ck.get("best") or {}
+            cfg = ck.get("cfg", {})
+            ab92[nm] = {"lambda_cons": cfg.get("lambda_cons"),
+                        "mae": vm.get("mae"), "macro_mae": vm.get("macro_mae"),
+                        "rho": vm.get("rho")}
+    except Exception as exc:                       # noqa: BLE001
+        L.append(f"_could not read probe_ab92_* ({type(exc).__name__})._\n")
+    if ab92:
+        L.append("| probe | lambda_cons | val MAE | val macro MAE | val rho |")
+        L.append("|---|---|---|---|---|")
+        for nm in ("probe_ab92_nuisance", "probe_ab92_cleanonly"):
+            g = ab92.get(nm)
+            if g:
+                L.append(f"| {nm.replace('probe_ab92_', '')} | {g['lambda_cons']} | "
+                         f"{g['mae']:.3f} | {g['macro_mae']:.3f} | {g['rho']:+.3f} |")
+        L.append("\n_superficial-cue dV per variant: `eval_probe.report(name=...)` "
+                 "for each. Near-identical dV between the two => superficial "
+                 "invariance is native to V-JEPA, not induced by the consistency "
+                 "term._\n")
+    else:
+        L.append("_probes/probe_ab92_{nuisance,cleanonly}.pt not found -- run "
+                 "`train_probe.py --arch proj_mean --lambda-cons {1,0}`._\n")
 
     # (3) attack-aware temporal upper bound
     L.append("\n### (3) attack-aware temporal upper bound (diagnostic only)\n")
