@@ -18,6 +18,12 @@
 #   VENVS=$HOME/venvs
 #   LOGS=$HOME/logs
 #   SKIP_SETUP=1     assume the venvs exist instead of building missing ones
+#   VARIANTS="..."   space-separated subset of the variants to score, e.g.
+#                    VARIANTS=identity for the codec control. Default is all
+#                    ten. Logs get a _v<joined> suffix so a control run never
+#                    collides with the pass-1 log it is correcting. Note this
+#                    also TIGHTENS the rendered-attack filter: run_judges only
+#                    keeps clips that have those exact renders.
 #   PARAPHRASE=1     run the prompt-paraphrase variant instead of pass 1:
 #                    same calls, decoding, parsers and variants, reworded
 #                    prompts, written to results/paraphrase/p<k>/. Logs get a
@@ -39,6 +45,22 @@ COUNT="${2:-8}"
 # meta-device corruption, so they cannot share one.
 DATASETS="${DATASETS:-${DATASET:-test implausibench_real implausibench_implausible}}"
 JUDGES="${JUDGES:-phyjudge_9b vila_ewm videophy2_auto}"
+VARIANTS="${VARIANTS:-}"
+if [ -n "$VARIANTS" ]; then
+  VAR_LIST=""
+  for v in $VARIANTS; do
+    case "$v" in
+      *[!a-z0-9_]*) echo "bad VARIANTS entry: '$v'" >&2; exit 1 ;;
+    esac
+    VAR_LIST="$VAR_LIST'$v',"
+  done
+  VAR_ARG=", variants=[$VAR_LIST]"
+  VAR_TAG="_v$(echo "$VARIANTS" | tr ' ' '-')"
+else
+  VAR_ARG=""
+  VAR_TAG=""
+fi
+
 PARAPHRASE="${PARAPHRASE:-}"
 if [ -n "$PARAPHRASE" ]; then
   case "$PARAPHRASE" in *[!0-9]*) echo "bad PARAPHRASE: '$PARAPHRASE'" >&2; exit 1 ;; esac
@@ -184,7 +206,7 @@ total_failed=0
 for judge in $JUDGES; do
   venv="$(venv_for "$judge")"
   for ds in $DATASETS; do
-  log="$LOGS/${judge}_${ds}_${IDX}${PARA_TAG}.log"
+  log="$LOGS/${judge}_${ds}_${IDX}${PARA_TAG}${VAR_TAG}.log"
   echo
   echo "---- $judge / $ds  ($(date '+%F %T'))  -> $log"
   t0=$(date +%s)
@@ -192,7 +214,7 @@ for judge in $JUDGES; do
   # -u or a detached log stays empty until the buffer flushes
   "$venv/bin/python" -u -c "
 from judge_harness import run_judges
-run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, $COUNT)$PARA_ARG)
+run_judges(dataset='$ds', num_clips=$NUM_CLIPS, models=['$judge'], shard=($IDX, $COUNT)$PARA_ARG$VAR_ARG)
 " 2>&1 | tee "$log"
   rc="${PIPESTATUS[0]}"
 
