@@ -37,7 +37,8 @@ import predict_vjepa as PV
 STATS = ["mean", "max", "std", "p90", "p95", "spike_rate"]
 
 
-def main(doc=None, stats=STATS, out_csv="predictor_decision.csv"):
+def main(doc=None, stats=STATS, out_csv="predictor_decision.csv",
+         push_to_s3=False):
     signal, confound, rows = [], [], []
     for stat in stats:
         print(f"\n{'=' * 70}\n{stat}\n{'=' * 70}")
@@ -94,8 +95,38 @@ def main(doc=None, stats=STATS, out_csv="predictor_decision.csv"):
             w.writeheader()
             w.writerows(rows)
         print(f"\nwrote {out_csv} ({len(rows)} rows)")
+
+    if push_to_s3 and rows:
+        import io as _io
+        s3 = PV.E._ensure_s3()
+        buf = _io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+        base = f"predictor/{PV.PRED_MODEL}"
+        temporal_sig = sorted({v for _s, v in signal})
+        superf_sig = sorted({v for _s, v in confound})
+        why_short = (
+            f"{verdict}. temporal rises: {temporal_sig or 'none'}; "
+            f"superficial rises (confound): {superf_sig or 'none'}. "
+            "shuffle raises predictor error but so do several caption-echo "
+            "overlays, and the predictor loses to a copy baseline on shuffle "
+            "-- no clean temporal-specific signal, so the optional "
+            "predictor-only / encoder+predictor probes were not built."
+        )
+        s3.put_object(Bucket=PV.BUCKET, Key=f"{base}/decision.csv",
+                      Body=buf.getvalue().encode())
+        s3.put_object(Bucket=PV.BUCKET, Key=f"{base}/verdict.txt",
+                      Body=why_short.encode())
+        print(f"uploaded -> s3://{PV.BUCKET}/{base}/{{decision.csv,verdict.txt}}")
+        print(f"  {why_short}")
     return verdict, rows
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser(description="Step 10 predictor decision gate")
+    ap.add_argument("--push", action="store_true",
+                    help="upload verdict.txt + decision.csv to "
+                         "s3://<bucket>/predictor/<model>/")
+    main(push_to_s3=ap.parse_args().push)

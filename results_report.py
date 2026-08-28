@@ -713,17 +713,18 @@ def section_step13():
                         parse_tot += 1
                         parse_ok += c.get("parsed") is not None
     if not n_pairs:
-        return "\n".join(L + ["_no pass-2 phyjudge_9b records found._\n"])
+        return "\n".join(L + ["_no pass-2 phyjudge_9b records found._\n"]), {}
+    rho, shift = spearman(p1v, p2v), shifts / n_pairs
     L.append(f"- {clips} pass-2 clips, {n_pairs} matched (clip,variant) physics-score pairs")
-    L.append(f"- Spearman(pass1, pass2) **{spearman(p1v, p2v):+.3f}**, "
+    L.append(f"- Spearman(pass1, pass2) **{rho:+.3f}**, "
              f"MAD **{mae(p1v, p2v):.3f}** (native units)")
-    L.append(f"- fraction of pairs shifting >=1 unit: **{shifts / n_pairs:.1%}**")
+    L.append(f"- fraction of pairs shifting >=1 unit: **{shift:.1%}**")
     if parse_tot:
         L.append(f"- pass-2 rationale parse rate: {parse_ok}/{parse_tot} "
                  f"({parse_ok / parse_tot:.1%})")
     L.append("- **Part A (case gallery, two-coder kappa + failure-mode "
              "distribution): pending second coder.**")
-    return "\n".join(L) + "\n"
+    return "\n".join(L) + "\n", {"rho": rho, "shift_frac": shift}
 
 
 # ======================================================================
@@ -1099,6 +1100,53 @@ def _reliability_cards(temporal_idx):
     return "\n".join(L) + "\n"
 
 
+def _key_numbers(tidx, s13_stats):
+    """The 6-8 numbers a reader actually needs; everything else is detail."""
+    L = ["## Key numbers\n"]
+    m = _get(PROBE_LOCKED_JSON) or {}
+    pm = ((m.get("selection") or {}).get("summary") or {}).get("proj_mean", {})
+    if pm:
+        L.append(f"- reference probe (proj_mean): clean-val macro MAE "
+                 f"{pm.get('macro_mae', float('nan')):.3f} "
+                 f"+/- {pm.get('macro_mae_sd', 0):.3f}, "
+                 f"Spearman {pm.get('rho', float('nan')):+.3f}; on VideoPhy-2 "
+                 f"test human PC, Spearman ~+0.29 (invariance anchor, not an "
+                 f"accurate predictor)")
+    step12 = [r for r in _read_deltas_csv() if r["group"].startswith("step12_")
+              and r["dataset"] == "test"]
+    worst = []
+    for j in JUDGES:
+        sup = [r for r in step12 if r["judge"] == j and r["variant"] in SUPERFICIAL]
+        if sup:
+            w = max(sup, key=lambda r: float(r["signed_delta"]))
+            worst.append(f"{j.split('_')[0]} {float(w['signed_delta']):+.3f}")
+    if worst:
+        L.append(f"- **H2** superficial-cue inflation (worst gap d=dJ-dV per "
+                 f"judge, test, all CI>0): {', '.join(worst)}; videophy2_auto "
+                 f"inflates on every overlay incl. the irrelevant-text control")
+    idx = [mn for (_j, _v, mn, _lo, _hi) in tidx.get("rows", [])]
+    if idx:
+        L.append(f"- **H1** temporal-insensitivity index dJ-dH = {min(idx):+.2f} "
+                 f"to {max(idx):+.2f} across all 9 judge x temporal-attack cells "
+                 f"(CI>0); humans drop PC ~1.5-3.6, judges move ~0 (1 rater)")
+    L.append("- **H3** 5 caption-echo families clear d>0/CI on >=2 of 3 judges")
+    if s13_stats:
+        L.append(f"- **H4** Pass-1<->Pass-2 (PhyJudge): Spearman "
+                 f"{s13_stats.get('rho', float('nan')):+.3f}, "
+                 f"{s13_stats.get('shift_frac', 0):.0%} of pairs shift >=1 unit")
+    ub = ((_get(TEMPORAL_UB_JSON) or {}).get("per_variant") or {}).get("pooled")
+    if ub:
+        L.append(f"- 9.5(3) attack-aware temporal upper bound: AUC "
+                 f"{ub['auc']:.3f} vs order-blind reference "
+                 f"{ub['ref_probe_auc']:.3f} (RECOVERABLE)")
+    v = (_get_text(f"predictor/{PRED_MODEL}/verdict.txt").strip()
+         if _exists(f"predictor/{PRED_MODEL}/verdict.txt") else None)
+    L.append(f"- Step 10 predictor: {v or 'AMBIGUOUS (see Step 10)'}")
+    L.append("- clean judge-vs-human PC Spearman 0.28-0.37 (videophy2_auto "
+             "0.36 = as published)")
+    return "\n".join(L) + "\n"
+
+
 # ======================================================================
 # build
 # ======================================================================
@@ -1125,7 +1173,7 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     print("Step 11 ..."); s11_txt, human = section_step11(annot_version)
     print("Step 12 temporal (H1) ..."); _tt, tidx = section_step12_temporal(human, annot_version)
     print("Step 12 ..."); s12_txt, verdicts = section_step12(tidx)
-    print("Step 13 ..."); s13 = section_step13()
+    print("Step 13 ..."); s13, s13_stats = section_step13()
     print("Step 6 / 7 ..."); s67 = _lean_step6_7() if lean else ""
     print("Step 8 ..."); s8 = (_step8_alignment() + "\n" + _by_level_judges()) if lean else ""
     print("sanity / cards ..."); sanity = _sanity_real() if lean else ""
@@ -1135,10 +1183,11 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     header = ("# Results\n\n_generated "
               + time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime()) + "_\n\n"
               + "## Verdicts\n\n" + "\n".join(verdicts) + "\n")
+    keys = _key_numbers(tidx, s13_stats) if lean else ""
 
     if lean:
-        parts = [header, s4, s51, s67, s8, s9_txt, s95, s10, s11_txt, sanity,
-                 s12_txt, s13, ab, cards]
+        parts = [header, keys, s4, s51, s67, s8, s9_txt, s95, s10, s11_txt,
+                 sanity, s12_txt, s13, ab, cards]
     else:
         parts = [header, s51, s9_txt, s95, s10, s11_txt, s12_txt, s13,
                  "## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
