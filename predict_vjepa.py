@@ -337,6 +337,31 @@ def _prep(processor, frames, device):
     return clip.unsqueeze(0).to(device)
 
 
+def _encode(encoder, x, masks=None):
+    """Encoder output in the representation the PREDICTOR consumes.
+
+    V-JEPA 2.1's encoder returns two different things:
+
+        if training or self.return_hierarchical:
+            return torch.cat(hier, dim=2)   # the 4 distillation layers, 4*D
+        else:
+            return x                        # the final layer only, D
+
+    and its predictor's input layer is Linear(embed_dim * 4, ...) while its
+    output projection is Linear(..., 4 * out_embed_dim). So the hierarchical
+    stack is the contract on BOTH sides -- feeding the plain final output is a
+    5632-vs-1408 shape error, which is exactly what --verify hit.
+
+    `training=` only selects that return branch; it does not put the module in
+    train mode (we stay under eval + inference_mode). V-JEPA 2's older encoder
+    has no such argument, so this falls back for that family.
+    """
+    try:
+        return encoder(x, masks, training=True) if masks is not None             else encoder(x, training=True)
+    except TypeError:
+        return encoder(x, masks) if masks is not None else encoder(x)
+
+
 def _encode_context(encoder, x, mx, mode):
     """Context tokens for every row: (rows, context*S, D).
 
@@ -345,9 +370,9 @@ def _encode_context(encoder, x, mx, mode):
     against a batch of 1 returns 31 independently-masked encodings.
     """
     if mode == "masked":
-        return encoder(x, [mx[i:i + 1] for i in range(len(mx))])
+        return _encode(encoder, x, [mx[i:i + 1] for i in range(len(mx))])
     if mode == "full":
-        tokens = encoder(x)
+        tokens = _encode(encoder, x)
         if isinstance(tokens, (list, tuple)):
             tokens = tokens[-1]
         return tokens[0][mx]
@@ -373,8 +398,11 @@ def predict_errors(processor, encoder, predictor, frames, device="cuda",
         with torch.autocast(device_type=device, dtype=torch.bfloat16,
                             enabled=(device == "cuda")):
             # the FULL-clip pass is the ground truth, and is meant to see
-            # everything -- upstream's target encoder does exactly this
-            tokens = encoder(x)
+            # everything -- upstream's target encoder does exactly this. It
+            # must be the hierarchical representation too: the predictor
+            # projects to 4 * out_embed_dim, so a plain final-layer target
+            # would not be the thing it was trained to produce.
+            tokens = _encode(encoder, x)
             if isinstance(tokens, (list, tuple)):
                 tokens = tokens[-1]
             n = int(tokens.shape[1])
@@ -427,7 +455,7 @@ def copy_baseline(processor, encoder, frames, device="cuda", context=CONTEXT):
     with torch.inference_mode():
         with torch.autocast(device_type=device, dtype=torch.bfloat16,
                             enabled=(device == "cuda")):
-            tokens = encoder(_prep(processor, frames, device))
+            tokens = _encode(encoder, _prep(processor, frames, device))
             if isinstance(tokens, (list, tuple)):
                 tokens = tokens[-1]
     mx, my = causal_masks(context, device=device)
