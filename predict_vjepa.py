@@ -85,6 +85,24 @@ HELD_OUT_SPLITS = E.HELD_OUT_SPLITS
 CONTEXT = 1
 MASK_INDEX = 1
 
+# CONTEXT_MODE: how the context tokens are produced.
+#
+#   "masked" -- encoder(x, [mask]) per row, so the context is encoded from the
+#     patches it is allowed to see and nothing else. This is what V-JEPA does
+#     in training: vision_transformer.forward applies the mask right after
+#     patch_embed, BEFORE the transformer blocks, so the hidden patches never
+#     enter attention. Costs a second encoder pass (~2x).
+#
+#   "full" -- encode the whole clip once and gather the context tokens out of
+#     it. Cheaper, but those tokens attended to the future before being
+#     gathered, so a bit of the answer leaks into the question and the
+#     predictor's job is easier than it should be.
+#
+# "masked" is the default because it is the faithful one. "full" is kept as the
+# fallback and as a robustness column: if the two disagree, the leak is doing
+# real work and that belongs in the writeup.
+CONTEXT_MODE = "masked"
+
 SPIKE_PERCENTILE = 95.0     # threshold from clean TRAIN only, per the doc
 N_BOOT = 2000
 
@@ -272,8 +290,44 @@ def causal_masks(context=CONTEXT, t=N_TEMPORAL, s=N_SPATIAL, device="cpu"):
     return xs, ys
 
 
+def _prep(processor, frames, device):
+    """Decode -> RGB -> preprocessor -> (1, C, T, H, W). Identical to
+    embed_vjepa.embed()'s front half, so the predictor and the probe are
+    looking at byte-identical model input."""
+    import torch
+    import cv2
+    idx = E.frame_indices(len(frames))
+    buf = np.stack([cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB) for i in idx])
+    clip = processor(buf)
+    if isinstance(clip, (list, tuple)):
+        clip = clip[0]
+    if clip.ndim != 4:
+        raise RuntimeError(f"preprocessor returned ndim={clip.ndim}, expected 4")
+    if clip.shape[0] != 3 and clip.shape[1] == 3:
+        clip = clip.permute(1, 0, 2, 3)
+    return clip.unsqueeze(0).to(device)
+
+
+def _encode_context(encoder, x, mx, mode):
+    """Context tokens for every row: (rows, context*S, D).
+
+    In "masked" mode the mask list is one entry per row, and apply_masks
+    concatenates along the batch dim -- so a single encoder call with 31 masks
+    against a batch of 1 returns 31 independently-masked encodings.
+    """
+    if mode == "masked":
+        return encoder(x, [mx[i:i + 1] for i in range(len(mx))])
+    if mode == "full":
+        tokens = encoder(x)
+        if isinstance(tokens, (list, tuple)):
+            tokens = tokens[-1]
+        return tokens[0][mx]
+    raise ValueError(f"context_mode must be 'masked' or 'full', got {mode!r}")
+
+
 def predict_errors(processor, encoder, predictor, frames, device="cuda",
-                   context=CONTEXT, mask_index=MASK_INDEX):
+                   context=CONTEXT, mask_index=MASK_INDEX,
+                   context_mode=CONTEXT_MODE):
     """-> (err[T-context], cos[T-context], err_tok[T-context, S])
 
     err is the L1 gap between predicted and actual latents, averaged over the
@@ -284,19 +338,13 @@ def predict_errors(processor, encoder, predictor, frames, device="cuda",
     """
     import torch
 
-    idx = E.frame_indices(len(frames))
-    import cv2
-    buf = np.stack([cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB) for i in idx])
-    clip = processor(buf)
-    if isinstance(clip, (list, tuple)):
-        clip = clip[0]
-    if clip.shape[0] != 3 and clip.shape[1] == 3:
-        clip = clip.permute(1, 0, 2, 3)
-    x = clip.unsqueeze(0).to(device)
+    x = _prep(processor, frames, device)
 
     with torch.inference_mode():
         with torch.autocast(device_type=device, dtype=torch.bfloat16,
                             enabled=(device == "cuda")):
+            # the FULL-clip pass is the ground truth, and is meant to see
+            # everything -- upstream's target encoder does exactly this
             tokens = encoder(x)
             if isinstance(tokens, (list, tuple)):
                 tokens = tokens[-1]
@@ -308,7 +356,12 @@ def predict_errors(processor, encoder, predictor, frames, device="cuda",
                     f"{N_TEMPORAL}x{N_SPATIAL} temporal-major grid")
 
             mx, my = causal_masks(context, device=device)
-            ctx = tokens[0][mx]                      # (rows, context*S, D)
+            ctx = _encode_context(encoder, x, mx, context_mode)
+            if ctx.shape[:2] != (len(mx), mx.shape[1]):
+                raise RuntimeError(
+                    f"context encoding is {tuple(ctx.shape)}, expected "
+                    f"({len(mx)}, {mx.shape[1]}, D). apply_masks did not "
+                    "expand the batch the way this assumes.")
             pred = predictor(ctx, mx, my, mask_index=mask_index)
 
     if isinstance(pred, (list, tuple)):
@@ -342,18 +395,10 @@ def copy_baseline(processor, encoder, frames, device="cuda", context=CONTEXT):
     two numbers are directly comparable.
     """
     import torch
-    import cv2
-    idx = E.frame_indices(len(frames))
-    buf = np.stack([cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB) for i in idx])
-    clip = processor(buf)
-    if isinstance(clip, (list, tuple)):
-        clip = clip[0]
-    if clip.shape[0] != 3 and clip.shape[1] == 3:
-        clip = clip.permute(1, 0, 2, 3)
     with torch.inference_mode():
         with torch.autocast(device_type=device, dtype=torch.bfloat16,
                             enabled=(device == "cuda")):
-            tokens = encoder(clip.unsqueeze(0).to(device))
+            tokens = encoder(_prep(processor, frames, device))
             if isinstance(tokens, (list, tuple)):
                 tokens = tokens[-1]
     mx, my = causal_masks(context, device=device)
@@ -396,7 +441,8 @@ def summarise(err, threshold=None):
 # --------------------------------------------------------------------- run
 
 def run(limit=None, device=None, dry_run=False, context=CONTEXT,
-        store_tokens=True, doc=None, models=None):
+        store_tokens=True, doc=None, models=None,
+        context_mode=CONTEXT_MODE):
     import torch
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -431,8 +477,9 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
                 if isinstance(p, Exception):
                     raise p
                 frames = E.read_clip(p)
-                err, cos, tok = predict_errors(processor, encoder, predictor,
-                                               frames, device, context)
+                err, cos, tok = predict_errors(
+                    processor, encoder, predictor, frames, device, context,
+                    context_mode=context_mode)
                 data[f"err_{variant}"] = err
                 data[f"cos_{variant}"] = cos
                 if store_tokens:
@@ -447,6 +494,7 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
                     Path(p).unlink(missing_ok=True)
 
         data["__context__"] = np.array([context])
+        data["__mode__"] = np.array([context_mode])
         write_cached(stem, data)
 
         if i % 25 == 0 or i == len(todo):
@@ -463,7 +511,7 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
 
 
 def run_all(datasets="train", device=None, dry_run=False, context=CONTEXT,
-            store_tokens=True, limit=None):
+            store_tokens=True, limit=None, context_mode=CONTEXT_MODE):
     """Several corpora back to back with the models loaded once.
 
     `datasets` takes embed_vjepa's spelling: "train" is the probe's own split
@@ -497,7 +545,7 @@ def run_all(datasets="train", device=None, dry_run=False, context=CONTEXT,
             doc = E.load_split() if name is None else E.load_doc(name)
             got = run(limit=limit, device=device, dry_run=dry_run,
                       context=context, store_tokens=store_tokens, doc=doc,
-                      models=models)
+                      models=models, context_mode=context_mode)
             summary.append((title, got.get("computed", 0),
                             got.get("failed", 0), None))
         except Exception as e:
@@ -536,41 +584,67 @@ def verify(device=None, n_clips=3, context=CONTEXT):
     stems = [s for s in sorted(doc["clips"])
              if doc["clips"][s]["split"] in ho][:n_clips]
     print(f"\nchecking {len(stems)} held-out clips (context={context})")
-    print(f"  {'clip':<28} {'pred':>9} {'copy':>9} {'ratio':>7} "
+    print("  both context modes are run so the faithful one can be shown to "
+          "work before a\n  long run commits to it, and so the leak in 'full' "
+          "is a measured number.")
+    print(f"\n  {'clip':<24} {'mode':<7} {'pred':>9} {'copy':>9} {'ratio':>7} "
           f"{'shuffle':>9} {'d':>9}")
-    ok = True
+
+    ok, usable = True, {}
     for stem in stems:
         try:
             clean = E.read_clip(E.download_video(E.video_key(doc, stem, "clean")))
-            e_clean, _, _ = predict_errors(processor, encoder, predictor,
-                                           clean, device, context)
-            base = copy_baseline(processor, encoder, clean, device, context)
             shuf = E.read_clip(E.download_video(
                 E.video_key(doc, stem, "shuffle")))
-            e_shuf, _, _ = predict_errors(processor, encoder, predictor,
-                                          shuf, device, context)
+            base = copy_baseline(processor, encoder, clean, device, context)
         except Exception as e:
-            print(f"  {stem[:28]:<28} FAILED {type(e).__name__}: {e}")
+            print(f"  {stem[:24]:<24} FAILED loading: {type(e).__name__}: {e}")
             ok = False
             continue
-        r = float(e_clean.mean() / base.mean())
-        d = float(e_shuf.mean() - e_clean.mean())
-        print(f"  {stem[:28]:<28} {e_clean.mean():>9.4f} {base.mean():>9.4f} "
-              f"{r:>7.3f} {e_shuf.mean():>9.4f} {d:>+9.4f}")
-        if r >= 1.0:
-            ok = False
+
+        for mode in ("masked", "full"):
+            try:
+                e_clean, _, _ = predict_errors(processor, encoder, predictor,
+                                               clean, device, context,
+                                               context_mode=mode)
+                e_shuf, _, _ = predict_errors(processor, encoder, predictor,
+                                              shuf, device, context,
+                                              context_mode=mode)
+            except Exception as e:
+                print(f"  {stem[:24]:<24} {mode:<7} FAILED "
+                      f"{type(e).__name__}: {e}")
+                usable.setdefault(mode, []).append(False)
+                continue
+            r = float(e_clean.mean() / base.mean())
+            usable.setdefault(mode, []).append(r < 1.0)
+            print(f"  {stem[:24]:<24} {mode:<7} {e_clean.mean():>9.4f} "
+                  f"{base.mean():>9.4f} {r:>7.3f} {e_shuf.mean():>9.4f} "
+                  f"{float(e_shuf.mean() - e_clean.mean()):>+9.4f}")
 
     print()
-    if ok:
-        print("  OK: the predictor beats copying the previous moment on every "
-              "clip.")
-    else:
-        print("  PROBLEM: the predictor did not beat a copy baseline. Either "
-              "the weights did not\n  load, or the causal mask is not "
-              "addressing moments -- run embed_vjepa --verify-axis.")
-    print("  the shuffle column is a pipeline sanity check, not the result; "
-          "nothing here\n  selects the config, which is pinned at the top of "
-          "this file.")
+    for mode in ("masked", "full"):
+        got = usable.get(mode, [])
+        state = ("beats the copy baseline on all "
+                 f"{len(got)}" if got and all(got) else "DID NOT WORK")
+        print(f"  {mode:<7} {state}")
+    good = bool(usable.get(CONTEXT_MODE)) and all(usable.get(CONTEXT_MODE, []))
+    ok = ok and good
+
+    if not good:
+        other = "full" if CONTEXT_MODE == "masked" else "masked"
+        print(f"\n  PROBLEM: the default mode ({CONTEXT_MODE}) is not usable.")
+        if usable.get(other) and all(usable[other]):
+            print(f"  {other} works -- rerun with --context-mode {other} and "
+                  "record the deviation.")
+        else:
+            print("  Neither mode beats copying the previous moment. Either "
+                  "the predictor weights\n  did not load, or the causal masks "
+                  "are not addressing moments -- check\n  embed_vjepa.py "
+                  "--verify-axis before anything else.")
+
+    print("\n  the shuffle column is a pipeline sanity check, NOT the result "
+          "and not a\n  selection criterion: the config is pinned at the top "
+          "of this file before any\n  of it runs.")
     return ok
 
 
@@ -762,6 +836,19 @@ def selftest():
     lo, hi = _boot_ci(np.random.default_rng(0).normal(1.0, 0.1, 400))
     check("a positive effect gives a CI above zero", lo > 0, f"[{lo:.3f},{hi:.3f}]")
 
+    print("context mode")
+    for bad in ("", "none", "Masked"):
+        try:
+            _encode_context(None, None, None, bad)
+            check(f"an unknown context_mode {bad!r} raises", False)
+        except ValueError:
+            check(f"an unknown context_mode {bad!r} raises", True)
+        except Exception as e:
+            check(f"an unknown context_mode {bad!r} raises",
+                  False, type(e).__name__)
+    check("the default is the faithful mode", CONTEXT_MODE == "masked",
+          CONTEXT_MODE)
+
     print("corpus selection")
     doc = {"superficial_variants": ["photometric", "caption_echo_rubric_vocab"],
            "held_out_splits": ["val", "cal"], "val_temporal_variants":
@@ -797,6 +884,11 @@ if __name__ == "__main__" and not in_notebook():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--context", type=int, default=CONTEXT)
+    ap.add_argument("--context-mode", choices=["masked", "full"],
+                    default=CONTEXT_MODE,
+                    help="masked: encode the context from only the patches "
+                         "it may see (faithful). full: gather from a "
+                         "whole-clip pass (cheaper, leaks the future)")
     ap.add_argument("--stat", default="mean",
                     choices=["mean", "max", "std", "p90", "p95", "spike_rate"])
     ap.add_argument("--no-tokens", action="store_true",
@@ -817,4 +909,4 @@ if __name__ == "__main__" and not in_notebook():
     else:
         run_all(datasets=a.datasets, device=a.device, dry_run=a.dry_run,
                 context=a.context, store_tokens=not a.no_tokens,
-                limit=a.limit)
+                limit=a.limit, context_mode=a.context_mode)
