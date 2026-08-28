@@ -215,7 +215,19 @@ ATTACK_FILES = [
     "caption_echo_control_irrelevant",
 ]
 
+# Not attacks -- the codec control. Every attacked variant above was written
+# out by ffmpeg and carries one extra libx264 CRF 23 pass that `clean` does
+# not, since clean IS the source object. `identity` is that pass with nothing
+# manipulated, so dJ(attack) - dJ(identity) is the codec-corrected effect.
+# Mirrors attack_suite.CONTROL_ATTACKS; edit the two together.
+CONTROL_FILES = ["identity"]
+
+# VARIANTS is the experiment and stays the default run, so adding the control
+# does not retroactively mark every completed clip incomplete -- audit_runs,
+# check_results and monitor all measure against a list of this length.
+# ALL_VARIANTS is only what `variants=` is allowed to name.
 VARIANTS = ["clean"] + ATTACK_FILES
+ALL_VARIANTS = VARIANTS + CONTROL_FILES
 
 IMPLAUSIBENCH_FIXED_CAPTION = "the events in the video appear to follow physics principles"
 
@@ -1303,7 +1315,11 @@ def results_frame(records):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["variant"] = pd.Categorical(df["variant"], categories=VARIANTS, ordered=True)
+    # ALL_VARIANTS, not VARIANTS: pd.Categorical maps anything outside
+    # `categories` to NaN, so an identity run would silently blank its own
+    # variant column and sort into a single undifferentiated block.
+    df["variant"] = pd.Categorical(df["variant"], categories=ALL_VARIANTS,
+                                   ordered=True)
     return df.sort_values(["clip", "model", "variant", "call"]).reset_index(drop=True)
 
 
@@ -1367,10 +1383,10 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     if variants is not None:
         variants = list(variants)
-        unknown = [v for v in variants if v not in VARIANTS]
+        unknown = [v for v in variants if v not in ALL_VARIANTS]
         if unknown:
             raise ValueError(f"unknown variant(s) {unknown}; "
-                             f"expected a subset of {VARIANTS}")
+                             f"expected a subset of {ALL_VARIANTS}")
         if not variants:
             raise ValueError("variants is empty; omit it to run all of VARIANTS")
         print(f"variants: {', '.join(variants)} "

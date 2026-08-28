@@ -34,6 +34,13 @@ CAPTION_ECHO_CATEGORIES = {
 FREEZE_DURATION_FRACTION = 1.0 / 3.0
 FREEZE_POINT_RANGE = (0.40, 0.60)
 
+# The 2x2 taxonomy: what the experiment measures.
+ATTACKS_2X2 = (["shuffle", "reverse", "freeze", "photometric"]
+               + [f"caption_echo:{cat}" for cat in CAPTION_ECHO_CATEGORIES])
+
+# Not an attack -- the codec control. See attack_identity().
+CONTROL_ATTACKS = ["identity"]
+
 
 s3 = None
 
@@ -113,6 +120,29 @@ def get_video_dims(path):
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     return w, h
+
+
+def attack_identity(inp, out):
+    """The codec control: one libx264 pass, nothing manipulated.
+
+    Every attacked variant is written out by ffmpeg and so carries one extra
+    lossy encode (CRF 23) that `clean` does not -- clean IS the source object,
+    never re-rendered. So a raw dJ mixes the attack with a generation of h264,
+    and the temporal deltas are small enough (~0.06) for that to matter. This
+    variant isolates the codec half: score it, and subtract.
+
+    `null` rather than vf=None on purpose -- run_ffmpeg only adds `-map 0:v`
+    when a filter is set, so passing a genuine pass-through filter makes the
+    command byte-identical in shape to the filtered attacks it is controlling
+    for, instead of merely similar.
+
+    This matches the direct-filter path (reverse, photometric, caption_echo).
+    shuffle and freeze additionally round-trip through OpenCV BGR and a
+    lossless FFV1 intermediate, so they carry one extra chroma resample on top
+    of the same libx264 encode. That difference is second order next to CRF 23
+    and is deliberately not controlled separately.
+    """
+    run_ffmpeg(inp, out, "null")
 
 
 def attack_reverse(inp, out):
@@ -239,7 +269,10 @@ def attack_photometric(inp, out):
 
 
 def apply_attack(attack_key, local_in, local_out, source_key):
-    if attack_key == "reverse":
+    if attack_key == "identity":
+        attack_identity(local_in, local_out)
+        return None
+    elif attack_key == "reverse":
         attack_reverse(local_in, local_out)
         return None
     elif attack_key == "shuffle":
@@ -319,7 +352,24 @@ def process_clip(dataset, source_key, all_attacks):
     return source_key
 
 
-def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS):
+def attack_set(name="2x2"):
+    """`2x2` is the taxonomy's nine; `control` is the codec control alone.
+
+    The control is deliberately NOT in the default set. It exists to correct a
+    judge-side delta, and the judges only ever score the benchmark corpus, so
+    rendering it over the probe's train split would be pure waste.
+    """
+    if name == "control":
+        return list(CONTROL_ATTACKS)
+    if name == "all":
+        return ATTACKS_2X2 + list(CONTROL_ATTACKS)
+    if name == "2x2":
+        return list(ATTACKS_2X2)
+    raise ValueError(f"attack set must be 2x2 | control | all, got {name!r}")
+
+
+def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS,
+              attacks="2x2"):
     if dataset not in DATASET_PREFIXES:
         raise ValueError(f"dataset must be one of {list(DATASET_PREFIXES)}")
     source_prefix = DATASET_PREFIXES[dataset]
@@ -329,8 +379,8 @@ def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS):
         print("No source videos found.")
         return
 
-    caption_echo_attacks = [f"caption_echo:{cat}" for cat in CAPTION_ECHO_CATEGORIES]
-    all_attacks = ["shuffle", "reverse", "freeze", "photometric"] + caption_echo_attacks
+    all_attacks = attack_set(attacks) if isinstance(attacks, str) else list(attacks)
+    print(f"attacks: {', '.join(all_attacks)}")
 
     already_done = sum(clip_fully_done(dataset, k, all_attacks) for k in source_keys)
     todo = [k for k in source_keys if not clip_fully_done(dataset, k, all_attacks)]
