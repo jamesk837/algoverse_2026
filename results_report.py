@@ -789,7 +789,7 @@ def _lean_step6_7(ds="test"):
         L.append("| judge | contrast | mean | 95% CI |")
         L.append("|---|---|---|---|")
         for r in c:
-            if r["dataset"] != ds:
+            if r["dataset"] != ds or r.get("group") != PHYS_GROUP[r["judge"]]:
                 continue
             L.append(f"| {r['judge']} | {r['contrast']} | {float(r['mean']):+.3f} | "
                      f"[{float(r['ci_lo']):+.3f}, {float(r['ci_hi']):+.3f}] |")
