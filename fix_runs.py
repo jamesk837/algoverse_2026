@@ -202,6 +202,9 @@ def scan(prefixes=None, datasets=None):
         if gaps:
             missing_renders[ds] = gaps
 
+    print(f"scanning {len(prefixes)} prefix(es): {', '.join(prefixes)}")
+    n_records = n_calls = 0
+
     to_rerun, unparsed = {}, []
     for prefix in prefixes:
         for judge in judges_for(prefix):
@@ -221,6 +224,7 @@ def scan(prefixes=None, datasets=None):
                 top = max(seen.values()) if seen else 0
                 want = [v for v in VARIANTS if seen.get(v, 0) >= 0.5 * top]
 
+                n_records += len(recs)
                 clips, calls, per_variant = 0, 0, Counter()
                 for key, rec in recs:
                     stem = rec.get("clip", "?")
@@ -233,6 +237,7 @@ def scan(prefixes=None, datasets=None):
                         done = runs.get(v, {}).get("calls", {})
                         for c in call_ids:
                             if c in done:
+                                n_calls += 1
                                 if done[c].get("parsed") is None:
                                     unparsed.append(
                                         (key, judge, prefix, ds, stem, v, c,
@@ -247,6 +252,14 @@ def scan(prefixes=None, datasets=None):
                     to_rerun[(prefix, judge, ds)] = {
                         "clips": clips, "calls": calls,
                         "variants": per_variant, "want": want}
+
+    print(f"  read {n_records} records, {n_calls} stored calls -> "
+          f"{len(unparsed)} unparsed, "
+          f"{sum(v['calls'] for v in to_rerun.values())} calls to re-judge, "
+          f"{sum(len(g) for g in missing_renders.values())} clips missing a render")
+    if n_records == 0:
+        print("  READ NOTHING -- wrong bucket, no credentials, or the result "
+              "prefixes are not where this expects them")
     return missing_renders, to_rerun, unparsed
 
 
