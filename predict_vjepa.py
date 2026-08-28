@@ -439,9 +439,20 @@ def predict_errors(processor, encoder, predictor, frames, device="cuda",
 
     err_tok = (pred - actual).abs().mean(dim=-1)              # (rows, S)
     cos = torch.nn.functional.cosine_similarity(pred, actual, dim=-1)
+
+    # The CONTROL, from the same tokens: error of "the next moment looks like
+    # the last one". It costs nothing here (the encoder pass already happened)
+    # and it is the comparison the Step 10 claim rests on -- a predictor whose
+    # error rises on shuffled clips has shown nothing until you know whether a
+    # trivial representation-change measure rises just as much. Reconstructing
+    # it later would mean re-encoding every clip, i.e. a second full run.
+    prev = tokens[0][mx.reshape(len(mx), -1, N_SPATIAL)[:, -1]].float()
+    base = (prev - actual).abs().mean(dim=-1).mean(dim=-1)
+
     return (err_tok.mean(dim=-1).cpu().numpy().astype(np.float32),
             cos.mean(dim=-1).cpu().numpy().astype(np.float32),
-            err_tok.cpu().numpy().astype(np.float16))
+            err_tok.cpu().numpy().astype(np.float16),
+            base.cpu().numpy().astype(np.float32))
 
 
 def copy_baseline(processor, encoder, frames, device="cuda", context=CONTEXT):
@@ -534,11 +545,12 @@ def run(limit=None, device=None, dry_run=False, context=CONTEXT,
                 if isinstance(p, Exception):
                     raise p
                 frames = E.read_clip(p)
-                err, cos, tok = predict_errors(
+                err, cos, tok, base = predict_errors(
                     processor, encoder, predictor, frames, device, context,
                     context_mode=context_mode)
                 data[f"err_{variant}"] = err
                 data[f"cos_{variant}"] = cos
+                data[f"base_{variant}"] = base
                 if store_tokens:
                     data[f"tok_{variant}"] = tok
                 done += 1
@@ -669,26 +681,29 @@ def verify(device=None, n_clips=3, context=CONTEXT, model=None):
             continue
 
         for ctx in contexts:
-            base = copy_baseline(processor, encoder, clean, device, ctx)
             for mode in ("masked", "full"):
                 try:
-                    e_clean, _, _ = predict_errors(processor, encoder,
-                                                   predictor, clean, device,
-                                                   ctx, context_mode=mode)
-                    e_shuf, _, _ = predict_errors(processor, encoder,
-                                                  predictor, shuf, device,
-                                                  ctx, context_mode=mode)
+                    e_clean, _, _, base = predict_errors(
+                        processor, encoder, predictor, clean, device, ctx,
+                        context_mode=mode)
+                    e_shuf, _, _, b_shuf = predict_errors(
+                        processor, encoder, predictor, shuf, device, ctx,
+                        context_mode=mode)
                 except Exception as e:
                     print(f"  {stem[:20]:<20} {ctx:>3} {mode:<7} FAILED "
                           f"{type(e).__name__}: {e}")
                     usable.setdefault((ctx, mode), []).append(False)
                     continue
-                r = float(e_clean.mean() / base.mean())
-                usable.setdefault((ctx, mode), []).append(r < 1.0)
+                d_pred = float(e_shuf.mean() - e_clean.mean())
+                d_copy = float(b_shuf.mean() - base.mean())
+                # the question is DISCRIMINATION, not prediction quality:
+                # does the predictor's error separate clean from shuffled by
+                # more than the trivial control does?
+                usable.setdefault((ctx, mode), []).append(d_pred > d_copy)
                 print(f"  {stem[:20]:<20} {ctx:>3} {mode:<7} "
                       f"{e_clean.mean():>9.4f} {base.mean():>9.4f} "
-                      f"{r:>7.3f} {e_shuf.mean():>9.4f} "
-                      f"{float(e_shuf.mean() - e_clean.mean()):>+9.4f}")
+                      f"{d_pred:>+9.4f} {d_copy:>+9.4f} "
+                      f"{'pred' if d_pred > d_copy else 'copy':>6}")
 
     print(f"\n  {'context':>8}  {'mode':<8} verdict")
     best = None
@@ -785,9 +800,10 @@ def collect(doc=None, stat="mean"):
         split = doc["clips"][stem]["split"]
         per = {}
         for k in data:
-            if not k.startswith("err_"):
-                continue
-            per[k[4:]] = summarise(data[k], threshold)[stat]
+            if k.startswith("err_"):
+                per[k[4:]] = summarise(data[k], threshold)[stat]
+            elif k.startswith("base_"):
+                per["copy:" + k[5:]] = summarise(data[k], threshold)[stat]
         if per:
             out[split][stem] = per
     return dict(out), threshold
@@ -805,11 +821,13 @@ def report(doc=None, stat="mean", push_to_s3=True):
 
     print(f"\n=== latent surprise ({stat} of the error sequence), "
           f"{len(clips)} held-out clips ===")
-    names = sorted({v for c in clips.values() for v in c if v != "clean"})
+    names = sorted({v for c in clips.values() for v in c
+                    if v not in ("clean", "copy:clean")})
     rows = {}
     for name in names:
-        pairs = [(c["clean"], c[name]) for c in clips.values()
-                 if "clean" in c and name in c]
+        ref = "copy:clean" if name.startswith("copy:") else "clean"
+        pairs = [(c[ref], c[name]) for c in clips.values()
+                 if ref in c and name in c]
         if not pairs:
             continue
         a = np.array([p[0] for p in pairs])
@@ -817,7 +835,9 @@ def report(doc=None, stat="mean", push_to_s3=True):
         d = b - a
         lo, hi = _boot_ci(d)
         rows[name] = {
-            "kind": "temporal" if name in TEMPORAL_VARIANTS else "superficial",
+            "kind": ("control" if name.startswith("copy:") else
+                     "temporal" if name in TEMPORAL_VARIANTS
+                     else "superficial"),
             "n": len(d), "clean": float(a.mean()), "attacked": float(b.mean()),
             "d": float(d.mean()), "lo": float(lo), "hi": float(hi),
             "auc": _auc(b, a),
@@ -826,11 +846,15 @@ def report(doc=None, stat="mean", push_to_s3=True):
     w = 34
     print(f"  {'variant':<{w}} {'n':>5} {'clean':>9} {'attacked':>9} "
           f"{'d':>9} {'95% CI':>21} {'AUC':>7}")
-    for kind in ("temporal", "superficial"):
-        want = ("should RISE -- the predictor is surprised" if kind == "temporal"
-                else "should not move -- dynamics are untouched")
-        print(f"  -- expected-{'sensitivity' if kind == 'temporal' else 'invariance'}"
-              f"  ({want})")
+    for kind in ("temporal", "superficial", "control"):
+        want = {"temporal": "should RISE -- the predictor is surprised",
+                "superficial": "should not move -- dynamics are untouched",
+                "control": "copy baseline: the predictor must BEAT these "
+                           "to have added anything"}[kind]
+        label = {"temporal": "expected-sensitivity",
+                 "superficial": "expected-invariance",
+                 "control": "CONTROL"}[kind]
+        print(f"  -- {label}  ({want})")
         for name in sorted(n for n in rows if rows[n]["kind"] == kind):
             r = rows[name]
             flag = ""
