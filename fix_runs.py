@@ -388,39 +388,117 @@ def render(missing_renders=None, datasets=None, num_workers=4):
           "rendered. Re-run the audit to confirm before re-judging.")
 
 
+# ------------------------------------------------------- did it load the LoRA
+
+def check_logs(logdir=None):
+    """Which runs scored with the BASE model instead of the fine-tuned adapter.
+
+    phyjudge's infer.load_model pulls Qwen3.5-9B and applies a LoRA. On a card
+    too small, or with a previous model still resident, accelerate offloads to
+    CPU and PEFT's adapter copy into meta-device layers becomes a silent no-op:
+    the run completes, writes results, exits 0, and every score came from bare
+    Qwen3.5. The ONLY evidence is `Some parameters are on the meta device` at
+    load time -- the result records carry no marker of it, so this cannot be
+    detected from S3 and has to be read out of the logs.
+
+    Logs are per box (run_shard writes $HOME/logs/<judge>_<dataset>_<shard>.log
+    and a paraphrase run appends _p<k>), so RUN THIS ON EVERY MACHINE. A box
+    whose logs are gone cannot be cleared by this check -- absence of a log is
+    absence of evidence, not evidence of a clean run.
+    """
+    logdir = os.path.expanduser(logdir or "~/logs")
+    print("=" * 78)
+    print(f"1. BASE-MODEL CHECK  ({logdir}, this box only)")
+    print("=" * 78)
+    if not os.path.isdir(logdir):
+        print(f"  no {logdir} on this box -- nothing to check here. If a judge "
+              f"ran on another machine, run this there too.")
+        return []
+
+    names = sorted(n for n in os.listdir(logdir) if n.endswith(".log"))
+    if not names:
+        print(f"  {logdir} is empty")
+        return []
+
+    void, skipped = [], []
+    for name in names:
+        path = os.path.join(logdir, name)
+        try:
+            with open(path, errors="replace") as fh:
+                text = fh.read()
+        except OSError as e:
+            print(f"  unreadable {name}: {e}")
+            continue
+        if "meta device" in text:
+            void.append(name)
+        if "SKIPPED:" in text:
+            skipped.append(name)
+
+    print(f"  {len(names)} log(s) checked")
+    if not void:
+        print("  clean: no 'meta device' in any log -- the adapter loaded")
+    else:
+        print(f"\n  VOID -- {len(void)} log(s) scored with the base model:")
+        for name in void:
+            stem = name[:-4]
+            para = re.search(r"_p(\d+)$", stem)
+            prefix = (f"results/paraphrase/p{para.group(1)}" if para
+                      else "results/pass1")
+            body = stem[: para.start()] if para else stem
+            judge = next((j for j in CALLS if body.startswith(j)), "<judge>")
+            ds = body[len(judge):].strip("_").rsplit("_", 1)[0] or "<dataset>"
+            print(f"    {name}")
+            print(f"      those scores are not usable. Delete and re-run:")
+            print(f"      aws s3 rm --recursive "
+                  f"s3://{BUCKET}/{prefix}/{judge}/{ds}/")
+    if skipped:
+        print(f"\n  DID NOT RUN -- {len(skipped)} log(s) where a judge failed "
+              f"to load and scored nothing:")
+        for name in skipped:
+            print(f"    {name}")
+    return void
+
+
 # ----------------------------------------------------------------------- plan
 
-def plan(prefixes=None, datasets=None):
+def plan(prefixes=None, datasets=None, logdir=None):
+    void = check_logs(logdir)
+
+    print()
     missing_renders, to_rerun, unparsed = scan(prefixes, datasets)
 
-    print("=" * 78)
-    print("1. MISSING RENDERS -- attack_suite, and BEFORE any re-judge")
-    print("=" * 78)
-    if not missing_renders:
-        print("  none")
-    for ds, gaps in missing_renders.items():
-        for stem, variants in sorted(gaps.items()):
-            print(f"  {ds:<28} {stem[:44]:<46} {', '.join(variants)}")
-    if missing_renders:
-        print("\n  python fix_runs.py --render        # then re-judge below")
-
     print("\n" + "=" * 78)
-    print("2. UNPARSED -- re-parse the stored raw, do NOT re-judge")
+    print("2. MISSING SCORES")
     print("=" * 78)
-    if not unparsed:
-        print("  none")
-    else:
+    n_gap = sum(v["calls"] for v in to_rerun.values())
+    if not n_gap and not unparsed:
+        print("  none -- every call that could be made has a score")
+    if n_gap:
+        print(f"  {n_gap} calls were never made -> regenerate, section 3")
+    if unparsed:
         per_call = Counter(row[6] for row in unparsed)
-        print(f"  {len(unparsed)} calls: "
+        print(f"  {len(unparsed)} calls ran but produced no score: "
               + ", ".join(f"{c}({n})" for c, n in per_call.most_common()))
-        print("  phyjudge decodes greedily, so a rerun reproduces the same "
-              "tokens and the same None.")
-        print("\n  python fix_runs.py --reparse            # dry run")
-        print("  python fix_runs.py --reparse --write")
+        print("    Regenerating these does nothing: phyjudge decodes greedily "
+              "(do_sample=False),")
+        print("    so the same prompt emits the same tokens and fails to parse "
+              "again. The score")
+        print("    is recoverable from the stored raw instead:")
+        print("      python fix_runs.py --reparse          # dry run")
+        print("      python fix_runs.py --reparse --write")
+    if missing_renders:
+        n = sum(len(v) for v in missing_renders.values())
+        print(f"\n  ({n} clip(s) are missing an attack render, so those calls "
+              f"could never be made.")
+        print(f"   Not counted above and not a judging gap -- "
+              f"`--render` if you ever want them.)")
 
     print("\n" + "=" * 78)
-    print("3. RE-JUDGE -- one judge per process, on the box with that stack")
+    print("3. REGENERATE -- one judge per process, on the box with that stack")
     print("=" * 78)
+    if void:
+        print("  NOTE clear the VOID prefixes in section 1 FIRST -- those "
+              "records look\n       complete, so a rerun will skip them.\n")
     if not to_rerun:
         print("  none")
     for (prefix, judge, ds), info in sorted(to_rerun.items()):
@@ -441,10 +519,10 @@ def plan(prefixes=None, datasets=None):
                   f"jh.PASS2_RESULT_PREFIX = {override!r}")
 
     print("\n" + "=" * 78)
-    print("The reruns regenerate ONLY the missing calls -- checkpointing is per")
-    print("(clip, variant, call), so a complete clip is skipped before its")
-    print("video is downloaded. num_clips=None means the whole corpus, which")
-    print("is what makes naming the clip unnecessary.")
+    print("Each command regenerates ONLY the missing calls -- checkpointing is")
+    print("per (clip, variant, call), so a complete clip is skipped before its")
+    print("video is downloaded. Run them ONE PER PROCESS: a second model load")
+    print("in a live interpreter is what causes the base-model failure above.")
     return missing_renders, to_rerun, unparsed
 
 
@@ -466,6 +544,7 @@ if __name__ == "__main__" and not in_notebook():
                     help="re-run attack_suite for the missing variants")
     ap.add_argument("--prefix", help="one run, e.g. results/pass1")
     ap.add_argument("--datasets", nargs="+", choices=DATASETS)
+    ap.add_argument("--logs", help="log directory (default ~/logs)")
     a = ap.parse_args()
     pfx = [a.prefix] if a.prefix else None
     if a.reparse:
@@ -473,4 +552,4 @@ if __name__ == "__main__" and not in_notebook():
     elif a.render:
         render(datasets=a.datasets)
     else:
-        plan(prefixes=pfx, datasets=a.datasets)
+        plan(prefixes=pfx, datasets=a.datasets, logdir=a.logs)
