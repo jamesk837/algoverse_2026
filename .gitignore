@@ -10,3 +10,5 @@ failed_downloads.csv
 colab_check_*.py
 tmp_annot/
 tmp_embed/
+analysis/data/
+analysis/venv/
