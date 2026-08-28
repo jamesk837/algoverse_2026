@@ -141,11 +141,13 @@ def main():
                                      kind=kind, n=len(d), signed_delta=a.mean(),
                                      ci_lo=lo, ci_hi=hi, mean_abs_delta=np.abs(a).mean()))
                 # gameability gap for this group
+                # judge-internal contrast -- NOT the doc's Step 12 gameability
+                # gap (that is dJ - dV vs the V-JEPA reference, reported below)
                 t = [x for v in TEMPORAL for x in paired_deltas(clips, group, v)]
                 s = [x for v in SUPERFICIAL for x in paired_deltas(clips, group, v)]
                 if t and s:
                     gap = np.mean(s) - np.mean(t)
-                    P(f"  gameability: temporal {np.mean(t):+.4f}  superficial {np.mean(s):+.4f}  gap {gap:+.4f}")
+                    P(f"  temporal-superficial contrast (judge-internal): temporal {np.mean(t):+.4f}  superficial {np.mean(s):+.4f}  contrast {gap:+.4f}")
 
         # human tracking, test only
         ds = "test"
@@ -205,6 +207,56 @@ def main():
                         ms.append(np.mean(d) if d else float("nan"))
                     spread = np.nanmax(ms) - np.nanmin(ms)
                     P(f"    {var:38s} {ms[0]:+8.4f} {ms[1]:+8.4f} {ms[2]:+8.4f} {spread:7.4f}")
+
+    # ---- Step 12 gameability gap: d = dJ - dV against the locked V-JEPA
+    # reference (reference/probe_locked/dv.json), paired per clip x variant.
+    # Both sides in normalised 0-1 units: dV ships d_norm; dJ is the physics-
+    # group delta divided by its scale span (1-5 scales -> 4, booleans -> 1).
+    dv_path = os.path.join(DATA, "dv.json")
+    if os.path.exists(dv_path):
+        dv = json.load(open(dv_path))["datasets"]
+        DS_MAP = {"test": "videophy2_test", "implausibench_real": "implausibench_real",
+                  "implausibench_implausible": "implausibench_implausible"}
+        SPAN = {"phyjudge_9b": 4.0, "vila_ewm": 1.0, "videophy2_auto": 4.0}
+        P(f"\n{'#'*78}\n# Step 12 gameability gap: d = dJ - dV  (normalised units, physics group)\n"
+          f"# dJ from pass1, dV from the locked V-JEPA probe; positive d on a\n"
+          f"# superficial variant = the judge moved when the reference did not\n{'#'*78}")
+        for judge in JUDGES:
+            group, span = PHYSICS_GROUP[judge], SPAN[judge]
+            for ds in DATASETS:
+                clips = cache["pass1"][(judge, ds)]
+                ref = dv.get(DS_MAP[ds], {}).get("clips", {})
+                P(f"\n== {judge} / {ds} ==")
+                P(f"  {'variant':38s} {'n':>4s} {'dJ':>8s} {'dV':>8s} {'d=dJ-dV':>9s} {'95% CI':>20s}")
+                for var in VARIANTS[1:]:
+                    gaps = []
+                    for c, per in clips.items():
+                        jc = per.get("clean", {}).get(group)
+                        jv = per.get(var, {}).get(group)
+                        rv = ref.get(c, {}).get("variants", {}).get(var)
+                        if jc is None or jv is None or rv is None:
+                            continue
+                        gaps.append(((jv - jc) / span) - rv["d_norm"])
+                    if len(gaps) < 5:
+                        continue
+                    a = np.array(gaps)
+                    lo, hi = boot_ci(gaps)
+                    dj = np.mean([(per[var][group] - per["clean"][group]) / span
+                                  for c, per in clips.items()
+                                  if per.get(var, {}).get(group) is not None
+                                  and per.get("clean", {}).get(group) is not None
+                                  and c in ref and var in ref[c].get("variants", {})])
+                    dvm = np.mean([ref[c]["variants"][var]["d_norm"] for c in clips
+                                   if c in ref and var in ref[c].get("variants", {})])
+                    flag = "  GAP>0" if lo > 0 else ("  GAP<0" if hi < 0 else "")
+                    P(f"  {var:38s} {len(a):4d} {dj:+8.4f} {dvm:+8.4f} {a.mean():+9.4f} [{lo:+8.4f},{hi:+8.4f}]{flag}")
+                    rows.append(dict(judge=judge, dataset=ds, group=f"step12_{group}",
+                                     variant=var,
+                                     kind="temporal" if var in TEMPORAL else "superficial",
+                                     n=len(a), signed_delta=a.mean(), ci_lo=lo, ci_hi=hi,
+                                     mean_abs_delta=np.abs(a).mean()))
+    else:
+        P("\n(no data/dv.json -- Step 12 dJ-dV section skipped)")
 
     txt = "\n".join(rep)
     open(os.path.join(HERE, "report.txt"), "w").write(txt)
