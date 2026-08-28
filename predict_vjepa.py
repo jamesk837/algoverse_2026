@@ -19,11 +19,15 @@ error sequence, which is the doc's "raw latent prediction-error sequence".
 Corpus, per the doc: clean train clips (which define the spike threshold and
 nothing else), plus held-out clean clips and ALL nine of their variants.
 
-    python predict_vjepa.py --verify          # DO THIS FIRST, ~2 min
+    python predict_vjepa.py --verify                    # DO THIS FIRST
     python predict_vjepa.py --dry-run
     python predict_vjepa.py --limit 20
-    python predict_vjepa.py                   # full run, resumable
-    python predict_vjepa.py --report
+    python predict_vjepa.py --datasets train all        # full run, resumable
+    python predict_vjepa.py --report --stat mean        # also p95, spike_rate
+
+NOTE the encoder here is NOT the probe's -- see PRED_MODEL. The 2.1 ViT-L is a
+distilled student whose predictor targets a 1664-d teacher space, so its
+prediction cannot be differenced against its own 1024-d tokens.
 
 Colab: wget embed_vjepa.py and this file, then
     import predict_vjepa; predict_vjepa.verify(); predict_vjepa.run()
@@ -54,14 +58,36 @@ except ImportError as e:
         "  - it needs boto3, opencv-python-headless and numpy") from e
 
 BUCKET = E.BUCKET
-HUB_MODEL = E.HUB_MODEL
+
+# NOT the probe's encoder, and this is forced rather than chosen.
+# vjepa2_1_vit_large_384 is `vjepa2_1_vitl_dist_vitG_384` -- a student DISTILLED
+# from ViT-gigantic, whose constructor passes teacher_embed_dim=1664. Its
+# predictor was trained to predict the TEACHER's representations, so its output
+# (1664) and its own encoder's tokens (1024) are different spaces by design and
+# cannot be differenced. Using it would need ViT-gigantic loaded alongside just
+# to supply ground truth -- two encoders, where the doc says "the pretrained
+# V-JEPA encoder and predictor".
+#
+# vjepa2_1_vit_giant_384 passes no teacher_embed_dim, so its predictor targets
+# its own encoder: the standard JEPA setup, one model, self-consistent. Same
+# 2.1 family, same 384 crop, same 64 frames and the same 32x576 token grid as
+# the probe's encoder, so preprocessing and masks are unchanged.
+#
+# What this costs: the predictor evidence comes from ViT-giant while the PC
+# probe reads ViT-L. That is fine for the question Step 10 asks ("does V-JEPA's
+# predictive mechanism detect abnormal temporal dynamics INDEPENDENTLY of the
+# PC probe" -- independent of the probe, not of the checkpoint). The narrower
+# question, whether that information is recoverable from the representation the
+# probe actually reads, is ablation 9.5(3)'s job and runs on the ViT-L packs.
+PRED_MODEL = "vjepa2_1_vit_giant_384"
 N_TEMPORAL = E.N_TEMPORAL          # 32 moments
 N_SPATIAL = E.N_SPATIAL            # 576 spatial tokens per moment
 EMBED_DIM = E.EMBED_DIM
 
-ERR_PREFIX = f"predictor/{HUB_MODEL}/errors"
-PACK_KEY = f"predictor/{HUB_MODEL}/pack.npz"
-REPORT_KEY = f"predictor/{HUB_MODEL}/report.json"
+# keyed by the predictor model, so switching checkpoints cannot silently mix
+# error sequences from two different models in one cache
+ERR_PREFIX = f"predictor/{PRED_MODEL}/errors"
+REPORT_KEY = f"predictor/{PRED_MODEL}/report.json"
 
 TMP_DIR = Path("./tmp_predict")
 
@@ -202,16 +228,18 @@ def cached_stems():
 
 # ------------------------------------------------------------------ model
 
-def load_models(device="cuda"):
+def load_models(device="cuda", model=None):
     """Encoder AND predictor. embed_vjepa deletes the predictor on line 416;
-    this is the same checkpoint, keeping both halves."""
+    this keeps both halves, from a checkpoint whose predictor targets its own
+    encoder -- see PRED_MODEL for why that is not the probe's checkpoint."""
     import torch
+    model = model or PRED_MODEL
 
-    print(f"loading {HUB_MODEL} (encoder + predictor) from torch.hub ...")
+    print(f"loading {model} (encoder + predictor) from torch.hub ...")
     processor = torch.hub.load(E.HUB_REPO, E.HUB_PREPROCESSOR,
                                crop_size=E.CROP_SIZE, trust_repo=True)
     E.patch_hub_base_url()
-    encoder, predictor = torch.hub.load(E.HUB_REPO, HUB_MODEL, trust_repo=True)
+    encoder, predictor = torch.hub.load(E.HUB_REPO, model, trust_repo=True)
 
     for m in (encoder, predictor):
         m.to(device).eval()
@@ -252,11 +280,12 @@ def check_predictor_weights(predictor):
     """
     import torch
     ckpts = sorted(Path(torch.hub.get_dir()).glob("checkpoints/*.pt"))
-    ckpts = [c for c in ckpts if "vitl" in c.name.lower()] or ckpts
+    # newest first: the model just loaded is the one most recently downloaded
+    ckpts = sorted(ckpts, key=lambda c: c.stat().st_mtime, reverse=True)
     if not ckpts:
         return None
     try:
-        blob = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
+        blob = torch.load(ckpts[0], map_location="cpu", weights_only=False)
         sd = blob["predictor"]
     except Exception:
         return None
@@ -562,7 +591,7 @@ def run_all(datasets="train", device=None, dry_run=False, context=CONTEXT,
     return summary
 
 
-def verify(device=None, n_clips=3, context=CONTEXT):
+def verify(device=None, n_clips=3, context=CONTEXT, model=None):
     """Run BEFORE the full run. Three things, in the order they can break.
 
     1. do the predictor weights match the checkpoint (strict=False can leave
@@ -578,7 +607,7 @@ def verify(device=None, n_clips=3, context=CONTEXT):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     doc = E.load_split()
-    processor, encoder, predictor = load_models(device)
+    processor, encoder, predictor = load_models(device, model)
 
     ho = E.held_out_splits(doc)
     stems = [s for s in sorted(doc["clips"])
@@ -895,6 +924,10 @@ if __name__ == "__main__" and not in_notebook():
                     help="skip the per-token errors (~35 KB/clip)")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--model", default=PRED_MODEL,
+                    help="hub name; must be a checkpoint whose predictor "
+                         "targets its OWN encoder (the 2.1 ViT-L is distilled "
+                         "and targets a 1664-d teacher instead)")
     ap.add_argument("--datasets", nargs="+", default=["train"],
                     help="train (the doc's Step 10 corpus) | all | a "
                          "benchmark corpus name")
@@ -903,7 +936,8 @@ if __name__ == "__main__" and not in_notebook():
     if a.selftest:
         raise SystemExit(0 if selftest() else 1)
     if a.verify:
-        raise SystemExit(0 if verify(device=a.device, context=a.context) else 1)
+        raise SystemExit(0 if verify(device=a.device, context=a.context,
+                                    model=a.model) else 1)
     if a.report:
         report(stat=a.stat, push_to_s3=not a.no_push)
     else:
