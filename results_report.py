@@ -536,7 +536,30 @@ def section_step11(annot_version="v1"):
     except Exception as exc:                       # noqa: BLE001
         return "\n".join(L + [f"_annotate.report() raised: "
                               f"{type(exc).__name__}: {exc}_\n"]), {}
-    L.append("```\n" + buf.getvalue().rstrip() + "\n```\n")
+    out = buf.getvalue()
+    rline = next((ln.strip() for ln in out.splitlines() if "raters (" in ln), "")
+    L.append(f"{rline}  (Krippendorff alpha / inter-rater kappa need >=2 raters)\n")
+    L.append("| attack | kind | clean-pref | 95% CI | dH (PC) | 95% CI |")
+    L.append("|---|---|---|---|---|---|")
+    for v in list(TEMPORAL) + SUPERFICIAL:
+        h = human.get(v)
+        if not h:
+            continue
+        lo, hi = h["ci"]
+        dlo, dhi = h["d_pc_ci"]
+        pref = ("--" if isinstance(h["clean_pref"], float)
+                and h["clean_pref"] != h["clean_pref"] else f"{h['clean_pref']:.2f}")
+        ci = "--" if lo != lo else f"[{lo:.2f}, {hi:.2f}]"
+        L.append(f"| {v} | {h['kind']} | {pref} | {ci} | "
+                 f"{h['d_pc']:+.2f} | [{dlo:+.2f}, {dhi:+.2f}] |")
+    # scale check + V-JEPA-vs-human verdict, one line each
+    for tag in ("== our clean PC vs the published", "== human vs locked V-JEPA"):
+        blk = out.split(tag, 1)
+        if len(blk) > 1:
+            keep = [ln for ln in blk[1].splitlines()[:12]
+                    if ln.strip() and not ln.strip().startswith("attack")]
+            L.append("\n_" + tag.strip("= ").strip() + ":_ "
+                     + " ".join(k.strip() for k in keep[:3]))
     return "\n".join(L) + "\n", human
 
 
@@ -596,21 +619,35 @@ def section_step12_temporal(human, annot_version="v1"):
 # Step 13  Pass-1 <-> Pass-2  (PhyJudge only)
 # ======================================================================
 
+PASS2_PREFIXES = ["results/pass2", "results/pass2_captions"]
+
+
+def _load_pass2(judge, ds, pred):
+    """pass-2 physics scores merged across every pass2* prefix (caption-echo
+    variants were written to results/pass2_captions/)."""
+    merged = {}
+    for pre in PASS2_PREFIXES:
+        for stem, per in load_pass(pre, judge, ds, pred).items():
+            merged.setdefault(stem, {}).update(per)
+    return merged
+
+
 def section_step13():
-    L = ["## Step 13 Pass-1 ↔ Pass-2 consistency (PhyJudge)\n"]
+    L = ["## Step 13 - Pass-1 <-> Pass-2 consistency (PhyJudge)\n"]
     judge = "phyjudge_9b"
     pred = PHYSICS_CALL[judge]
-    rows = 0
+    clips = 0
     p1v, p2v, shifts, n_pairs = [], [], 0, 0
     parse_ok = parse_tot = 0
     for ds in DATASETS:
         p1 = load_pass("results/pass1", judge, ds, pred)
-        p2 = load_pass(PASS2_PREFIX, judge, ds, pred)
+        p2 = _load_pass2(judge, ds, pred)
         if not p2:
             continue
-        rows += len(p2)
+        clips += len(p2)
         for stem, per2 in p2.items():
-            per1 = p1.get(stem, {})
+            per1 = p1.get(stem) or p1.get(stem.removesuffix("_result")) \
+                or p1.get(stem + "_result") or {}
             for v, s2 in per2.items():
                 s1 = per1.get(v)
                 if s1 is None:
@@ -620,28 +657,28 @@ def section_step13():
                 n_pairs += 1
                 if abs(s2 - s1) >= 1.0:
                     shifts += 1
-        # parse quality: fraction of pass-2 calls that parsed
-        for rec in _get_many([k for k in _list(f"{PASS2_PREFIX}/{judge}/{ds}/")
-                              if k.endswith(".json")]):
-            if not rec:
-                continue
-            for r in rec.get("runs", {}).values():
-                for cid, c in r.get("calls", {}).items():
-                    if not pred(cid):
-                        continue
-                    parse_tot += 1
-                    if c.get("parsed") is not None:
-                        parse_ok += 1
+        for pre in PASS2_PREFIXES:
+            for rec in _get_many([k for k in _list(f"{pre}/{judge}/{ds}/")
+                                  if k.endswith(".json")]):
+                if not rec:
+                    continue
+                for r in rec.get("runs", {}).values():
+                    for cid, c in r.get("calls", {}).items():
+                        if not pred(cid):
+                            continue
+                        parse_tot += 1
+                        parse_ok += c.get("parsed") is not None
     if not n_pairs:
-        return "\n".join(L + ["_no results/pass2/phyjudge_9b records found._\n"])
-    L.append(f"- {rows} pass-2 clips, {n_pairs} matched (clip,variant) physics-"
-             f"score pairs")
-    L.append(f"- **Spearman(pass1, pass2) {spearman(p1v, p2v):+.3f}**, "
-             f"**MAD {mae(p1v, p2v):.3f}** (native units)")
-    L.append(f"- fraction shifting ≥1 unit: {shifts / n_pairs:.1%}")
+        return "\n".join(L + ["_no pass-2 phyjudge_9b records found._\n"])
+    L.append(f"- {clips} pass-2 clips, {n_pairs} matched (clip,variant) physics-score pairs")
+    L.append(f"- Spearman(pass1, pass2) **{spearman(p1v, p2v):+.3f}**, "
+             f"MAD **{mae(p1v, p2v):.3f}** (native units)")
+    L.append(f"- fraction of pairs shifting >=1 unit: **{shifts / n_pairs:.1%}**")
     if parse_tot:
-        L.append(f"- pass-2 parse rate: {parse_ok}/{parse_tot} "
+        L.append(f"- pass-2 rationale parse rate: {parse_ok}/{parse_tot} "
                  f"({parse_ok / parse_tot:.1%})")
+    L.append("- **Part A (case gallery, two-coder kappa + failure-mode "
+             "distribution): pending second coder.**")
     return "\n".join(L) + "\n"
 
 
@@ -658,75 +695,99 @@ def _read_deltas_csv():
     return []
 
 
-def section_table1_and_verdicts(step9_stats, temporal_idx):
-    L = ["## Table 1 + H1–H4 verdicts\n"]
-    rows = _read_deltas_csv()
-    step12 = [r for r in rows if r["group"].startswith("step12_")]
+def section_step12(temporal_idx):
+    """Table 1 + the H2 inflation index + the H1 temporal index + worst-case.
+    Returns (text, verdict_lines)."""
+    L = ["## Step 12 - gameability metrics\n"]
+    step12 = [r for r in _read_deltas_csv() if r["group"].startswith("step12_")]
+    T1 = ("shuffle", "freeze", "caption_echo_rubric_vocab")
 
-    # Table 1: test split, per judge, shuffle / freeze / caption_echo_rubric_vocab
-    L.append("### Table 1 — reference-relative gameability gap Δ = "
-             "ΔJ − ΔV, VideoPhy-2 test (n=450)\n")
-    if step12:
-        L.append("| judge | shuffle | freeze | caption_echo_rubric_vocab |")
-        L.append("|---|---|---|---|")
-        for judge in JUDGES:
-            cells = []
-            for v in ("shuffle", "freeze", "caption_echo_rubric_vocab"):
-                m = next((r for r in step12 if r["judge"] == judge
-                          and r["dataset"] == "test" and r["variant"] == v), None)
-                if m:
-                    cells.append(f"{float(m['signed_delta']):+.3f} "
-                                 f"[{float(m['ci_lo']):+.3f}, {float(m['ci_hi']):+.3f}]")
-                else:
-                    cells.append("—")
-            L.append(f"| {judge} | " + " | ".join(cells) + " |")
-    else:
-        L.append("_no step12 rows in deltas.csv -- analyze.py did not run or "
-                 "dv.json was missing._\n")
-
-    # H2: superficial inflation -- any superficial variant with CI>0
-    L.append("\n### H2 — superficial-cue inflation (Δ = ΔJ − ΔV > 0)\n")
-    h2_hits = defaultdict(list)
-    for r in step12:
-        if r["kind"] == "superficial" and float(r["ci_lo"]) > 0:
-            h2_hits[r["judge"]].append(f"{r['variant']}@{r['dataset']}")
+    L.append("### Table 1 - reference-relative gap  d = dJ - dV  "
+             "(VideoPhy-2 test, n=450, [95% CI])\n")
+    L.append("| judge | " + " | ".join(T1) + " |")
+    L.append("|---|---|---|---|")
     for judge in JUDGES:
-        L.append(f"- {judge}: " + (", ".join(sorted(set(h2_hits[judge])))
-                                   if h2_hits[judge] else "no inflated superficial variant"))
-    h2 = sum(1 for j in JUDGES if h2_hits[j]) >= 2
+        cells = []
+        for v in T1:
+            m = next((r for r in step12 if r["judge"] == judge
+                      and r["dataset"] == "test" and r["variant"] == v), None)
+            cells.append(f"{float(m['signed_delta']):+.3f} "
+                         f"[{float(m['ci_lo']):+.3f}, {float(m['ci_hi']):+.3f}]"
+                         if m else "--")
+        L.append(f"| {judge} | " + " | ".join(cells) + " |")
 
-    # H3: at least one attack family with CI>0 for >=2 of 3 judges
+    L.append("\n### H2 - superficial-cue inflation index  d = dJ - dV  "
+             "(test, * = 95% CI excludes 0)\n")
+    L.append("| judge | " + " | ".join(v.replace("caption_echo_", "")
+                                       for v in SUPERFICIAL) + " |")
+    L.append("|" + "---|" * (len(SUPERFICIAL) + 1))
+    h2_judges = set()
+    for judge in JUDGES:
+        cells = []
+        for v in SUPERFICIAL:
+            m = next((r for r in step12 if r["judge"] == judge
+                      and r["dataset"] == "test" and r["variant"] == v), None)
+            if not m:
+                cells.append("--")
+                continue
+            star = "*" if float(m["ci_lo"]) > 0 else ""
+            if star:
+                h2_judges.add(judge)
+            cells.append(f"{float(m['signed_delta']):+.3f}{star}")
+        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+
     fam_judges = defaultdict(set)
     for r in step12:
-        if float(r["ci_lo"]) > 0:
+        if r["dataset"] == "test" and float(r["ci_lo"]) > 0:
             fam_judges[r["variant"]].add(r["judge"])
-    h3_fams = {v: sorted(js) for v, js in fam_judges.items() if len(js) >= 2}
-    L.append("\n### H3 — shared vulnerability (Δ>0, CI excl. 0, ≥2 judges)\n")
-    L.append("- " + (", ".join(f"{v}: {js}" for v, js in h3_fams.items())
-                     if h3_fams else "no attack family clears the bar for 2+ judges"))
+    h3_fams = {v: sorted(j) for v, j in fam_judges.items() if len(j) >= 2}
+    L.append("\n### H3 - families with d>0 (CI excl. 0) on >=2 judges (test)\n")
+    L.append("- " + (", ".join(f"{v} ({len(j)})" for v, j in h3_fams.items())
+                     or "none"))
+
+    L.append("\n### H1 - temporal-insensitivity index  dJ - dH  "
+             "(annotated subset, n=60, [95% CI])\n")
+    L.append("| judge | shuffle | reverse | freeze |")
+    L.append("|---|---|---|---|")
+    tix = defaultdict(dict)
+    for (j, v, mn, lo, hi) in temporal_idx.get("rows", []):
+        tix[j][v] = (mn, lo, hi)
+    h1_ok = 0
+    for judge in JUDGES:
+        cells = []
+        for v in ("shuffle", "reverse", "freeze"):
+            r = tix[judge].get(v)
+            if not r:
+                cells.append("--")
+                continue
+            h1_ok += r[1] > 0
+            cells.append(f"{r[0]:+.3f} [{r[1]:+.3f}, {r[2]:+.3f}]")
+        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+
+    L.append("\n### worst-case gap per judge (test, any attack family)\n")
+    for judge in JUDGES:
+        jr = [r for r in step12 if r["judge"] == judge and r["dataset"] == "test"]
+        if jr:
+            w = max(jr, key=lambda r: float(r["signed_delta"]))
+            L.append(f"- {judge}: {w['variant']} d = "
+                     f"{float(w['signed_delta']):+.3f} "
+                     f"[{float(w['ci_lo']):+.3f}, {float(w['ci_hi']):+.3f}]")
+
+    h1 = h1_ok >= 3
+    h2 = len(h2_judges) >= 2
     h3 = bool(h3_fams)
-
-    # H1: temporal index rows with CI>0
-    L.append("\n### H1 — temporal insensitivity (ΔJ − ΔH > 0, CI excl. 0)\n")
-    h1_hits = [f"{j}/{v}" for (j, v, m, lo, hi) in temporal_idx.get("rows", [])
-               if lo > 0]
-    L.append("- " + (", ".join(h1_hits) if h1_hits
-                     else "no judge/temporal-attack index CI excludes 0 on the "
-                          "annotated subset (n is small -- read as directional)"))
-    h1 = bool(h1_hits)
-
-    L.append("\n### summary\n")
-    L.append(f"- **H1 temporal blindness**: {'supported' if h1 else 'not established'} "
-             f"(annotated subset, one rater)")
-    L.append(f"- **H2 superficial exploitation**: {'supported' if h2 else 'not supported'}")
-    L.append(f"- **H3 shared vulnerability**: {'supported' if h3 else 'not supported'}")
-    L.append("- **H4 attributable failure modes**: see Step 13 (Pass1↔Pass2) "
-             "and the case gallery (manual two-coder task, not in this script)")
-    if step9_stats:
-        L.append(f"\n_reference sanity: locked probe on test human PC — MAE "
-                 f"{step9_stats.get('mae', float('nan')):.3f}, Spearman "
-                 f"{step9_stats.get('rho', float('nan')):+.3f} (n={step9_stats.get('n')})_")
-    return "\n".join(L) + "\n"
+    verdicts = [
+        f"- **H1 temporal blindness**: {'SUPPORTED' if h1 else 'not established'} "
+        f"- dJ-dH > 0 with CI excl. 0 on {h1_ok}/9 judge x temporal-attack cells "
+        f"(annotated subset, 1 rater)",
+        f"- **H2 superficial-cue exploitation**: {'SUPPORTED' if h2 else 'not supported'} "
+        f"- caption-echo overlays inflate {len(h2_judges)}/3 judges (d = dJ-dV > 0, CI excl. 0)",
+        f"- **H3 shared vulnerability**: {'SUPPORTED' if h3 else 'not supported'} "
+        f"- {', '.join(h3_fams) or 'no family'} clears d>0/CI on >=2 judges",
+        "- **H4 failure attribution**: Pass-1<->Pass-2 stable (see Step 13); "
+        "case-gallery two-coder kappa pending second coder",
+    ]
+    return "\n".join(L) + "\n", verdicts
 
 
 # ======================================================================
@@ -841,6 +902,47 @@ def _step8_alignment():
     return "\n".join(L) + "\n"
 
 
+def _ablation_10_11():
+    """(10) prompt robustness native<->p0/p1, (11) identity codec correction --
+    both compact, from the synced JSONs / deltas.csv."""
+    L = ["## Ablation 10 - judge-prompt robustness (native vs 2 paraphrases, "
+         "clean physics score, test)\n",
+         "| judge | rho p0 | MAD p0 | rho p1 | MAD p1 |", "|---|---|---|---|---|"]
+    for judge in JUDGES:
+        base = load_pass("results/pass1", judge, "test", PHYS_GROUP_CALL[judge])
+        cells = []
+        for run in ("results/paraphrase/p0", "results/paraphrase/p1"):
+            other = load_pass(run, judge, "test", PHYS_GROUP_CALL[judge])
+            pairs = [(pv["clean"], other[s]["clean"]) for s, pv in base.items()
+                     if "clean" in pv and s in other and "clean" in other[s]]
+            if len(pairs) < 5:
+                cells += ["--", "--"]
+                continue
+            a, b = zip(*pairs)
+            cells += [f"{spearman(a, b):+.3f}", f"{mae(a, b):.3f}"]
+        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+
+    d = _read_deltas_csv()
+    L.append("\n## Ablation 11 - identity re-encode control (test, temporal "
+             "variants: raw dJ vs codec-corrected)\n")
+    L.append("| judge | shuffle raw / corr | reverse raw / corr | freeze raw / corr |")
+    L.append("|---|---|---|---|")
+    for judge in JUDGES:
+        cells = []
+        for v in ("shuffle", "reverse", "freeze"):
+            m = next((r for r in d if r["judge"] == judge and r["dataset"] == "test"
+                      and r["group"] == PHYS_GROUP[judge] and r["variant"] == v), None)
+            if m and m.get("signed_delta_corr") not in (None, "", "nan"):
+                cells.append(f"{float(m['signed_delta']):+.3f} / "
+                             f"{float(m['signed_delta_corr']):+.3f}")
+            elif m:
+                cells.append(f"{float(m['signed_delta']):+.3f} / --")
+            else:
+                cells.append("--")
+        L.append(f"| {judge} | " + " | ".join(cells) + " |")
+    return "\n".join(L) + "\n"
+
+
 # ======================================================================
 # build
 # ======================================================================
@@ -848,7 +950,6 @@ def _step8_alignment():
 def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
           annot_version="v1", out="RESULTS.md", lean=True):
     t0 = time.time()
-    parts = [f"# Consolidated results\n\n_generated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}_\n"]
 
     if not no_analyze:
         if not skip_sync:
@@ -859,37 +960,29 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     else:
         analyze_txt = "[--no-analyze: skipped]"
 
-    print("5.1 ...")
-    parts.append(section_5_1())
-    print("Step 9 ...")
-    s9 = section_step9()
-    s9_txt, s9_stats = s9 if isinstance(s9, tuple) else (s9, {})
-    parts.append(s9_txt)
-    print("Step 9.5 ...")
-    parts.append(section_step9_5())
-    print("Step 10 ...")
-    parts.append(section_step10())
-    print("Step 11 ...")
-    s11_txt, human = section_step11(annot_version)
-    print("Step 12 temporal (H1) ...")
-    s12_txt, tidx = section_step12_temporal(human, annot_version)
-    print("Step 13 ...")
-    s13_txt = section_step13()
-    print("Table 1 + verdicts ...")
-    parts.append(section_table1_and_verdicts(s9_stats, tidx))
-    parts.append(s11_txt)
-    parts.append(s12_txt)
-    parts.append(s13_txt)
+    print("5.1 ..."); s51 = section_5_1()
+    print("Step 9 ..."); s9 = section_step9()
+    s9_txt, _ = s9 if isinstance(s9, tuple) else (s9, {})
+    print("Step 9.5 ..."); s95 = section_step9_5()
+    print("Step 10 ..."); s10 = section_step10()
+    print("Step 11 ..."); s11_txt, human = section_step11(annot_version)
+    print("Step 12 temporal (H1) ..."); _tt, tidx = section_step12_temporal(human, annot_version)
+    print("Step 12 ..."); s12_txt, verdicts = section_step12(tidx)
+    print("Step 13 ..."); s13 = section_step13()
+    print("Step 6 / 7 ..."); s67 = _lean_step6_7() if lean else ""
+    print("Step 8 ..."); s8 = _step8_alignment() if lean else ""
+    print("Ablations 10 / 11 ..."); ab = _ablation_10_11() if lean else ""
+
+    header = ("# Results\n\n_generated "
+              + time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime()) + "_\n\n"
+              + "## Verdicts\n\n" + "\n".join(verdicts) + "\n")
 
     if lean:
-        parts.append(_lean_step6_7())
-        parts.append(_step8_alignment())
-        parts.append("\n_per-dataset / pooled / compression / prompt-robustness "
-                     "(ablation 10) / identity-corrected (ablation 11) numbers are in "
-                     "analysis/deltas.csv, contrasts.csv and report.txt._\n")
+        parts = [header, s51, s67, s8, s9_txt, s95, s10, s11_txt, s12_txt, s13, ab]
     else:
-        parts.append("## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
-                     "```\n" + analyze_txt.rstrip() + "\n```\n")
+        parts = [header, s51, s9_txt, s95, s10, s11_txt, s12_txt, s13,
+                 "## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
+                 "```\n" + analyze_txt.rstrip() + "\n```\n"]
 
     doc = "\n".join(parts)
     Path(out).write_text(doc, encoding="utf-8")
