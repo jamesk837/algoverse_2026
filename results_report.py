@@ -618,12 +618,30 @@ def section_step12_temporal(human, annot_version="v1"):
         return "\n".join(L + ["_no human deltas (Step 11 did not run)._\n"]), {}
     an = _adopt("annotate", ["load_records"])
     stems = set()
+    # per-clip human delta, so the index can be paired WITHIN a clip. Using the
+    # per-attack mean dH instead makes it a constant offset and the bootstrap
+    # then reflects only dJ's variance, understating the interval.
+    dh_clip = defaultdict(lambda: defaultdict(list))
     try:
         for r in an.load_records(annot_version, None, prefer_local=False):
-            if not r.get("skipped"):
-                stems.add(r["stem"])
+            if r.get("skipped"):
+                continue
+            stems.add(r["stem"])
+            pc_c, pc_v = r.get("pc_clean"), r.get("pc_variant")
+            if isinstance(pc_c, (int, float)) and isinstance(pc_v, (int, float)):
+                dh_clip[r["stem"]][r["variant"]].append(
+                    (float(pc_v) - float(pc_c)) / 4.0)
     except Exception:
         pass
+
+    def _dh(stem, variant):
+        """mean human delta for this clip x variant, tolerating the _result
+        suffix mismatch between annotation stems and pass-1 clip ids."""
+        for key in (stem, stem + "_result", stem.removesuffix("_result")):
+            vals = dh_clip.get(key, {}).get(variant)
+            if vals:
+                return float(np.mean(vals))
+        return None
     L.append(f"- annotated base clips: {len(stems)}\n")
     L.append("| judge | attack | dJ (norm) | dH (norm, /4) | index dJ−dH | 95% CI | n |")
     L.append("|---|---|---|---|---|---|---|")
@@ -639,23 +657,30 @@ def section_step12_temporal(human, annot_version="v1"):
                 if key in stems or stem in stems:
                     perclip[key] = per
         for v in sorted(TEMPORAL):
-            hj = human.get(v)
-            if not hj or v == "clean":
+            if v == "clean" or v not in human:
                 continue
-            dh = hj["d_pc"] / 4.0
-            dJ_list = [(per[v] - per["clean"]) / span for per in perclip.values()
-                       if "clean" in per and v in per]
+            dJ_list, dH_list = [], []
+            for key, per in perclip.items():
+                if "clean" not in per or v not in per:
+                    continue
+                dh_i = _dh(key, v)
+                if dh_i is None:
+                    continue
+                dJ_list.append((per[v] - per["clean"]) / span)
+                dH_list.append(dh_i)
             if len(dJ_list) < 5:
                 continue
-            idx = [x - dh for x in dJ_list]
+            idx = [a - b for a, b in zip(dJ_list, dH_list)]
             lo, hi = boot_ci(idx)
             flag = "  H1-POSITIVE" if lo > 0 else ""
-            L.append(f"| {judge} | {v} | {np.mean(dJ_list):+.4f} | {dh:+.4f} | "
-                     f"{np.mean(idx):+.4f} | [{lo:+.4f}, {hi:+.4f}] | {len(dJ_list)} |{flag}")
+            L.append(f"| {judge} | {v} | {np.mean(dJ_list):+.4f} | "
+                     f"{np.mean(dH_list):+.4f} | {np.mean(idx):+.4f} | "
+                     f"[{lo:+.4f}, {hi:+.4f}] | {len(dJ_list)} |{flag}")
             verdict_rows.append((judge, v, np.mean(idx), lo, hi))
     L.append("\n_index > 0 with CI excluding 0 = the judge under-responds to a "
-             "temporal attack humans flagged (H1). dH is the rater's mean "
-             "(pc_variant − pc_clean), normalised by the 1-5 span._\n")
+             "temporal attack humans flagged (H1). dJ and dH are paired WITHIN "
+             "each clip and the bootstrap resamples clips, so the interval "
+             "carries uncertainty in both terms._\n")
     return "\n".join(L) + "\n", {"rows": verdict_rows}
 
 
