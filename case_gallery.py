@@ -866,6 +866,165 @@ def faithfulness_report(version="v1"):
             "unfaithful_rate": (by["unfaithful"] + by["partial"]) / n}
 
 
+# ---- targeted side-sample: PhyJudge Pass-2 cases by gameability gap ----
+# Used when the main case gallery does not overlap the committed Pass-2 subset.
+# Single judgement, judged against the OBSERVED behaviour (score direction), not
+# a two-coder label -- report it as a small qualitative side-analysis.
+
+_PASS2_PREFIXES = ["results/pass2", "results/pass2_captions"]
+_SAMPLE_KEY = "case_faithfulness_sample/{coder}.jsonl"
+
+
+def _pass2_phyjudge(ds):
+    merged = {}
+    for pre in _PASS2_PREFIXES:
+        for stem, per in _judge_physics(pre, "phyjudge_9b", ds).items():
+            merged.setdefault(stem, {}).update(per)
+    return merged
+
+
+def _pass2_gap_cases(n=5):
+    dv = _dv_index()
+    span = SCALE_SPAN["phyjudge_9b"]
+    rows = []
+    for ds in DATASETS:
+        p1 = _judge_physics(PASS1, "phyjudge_9b", ds)
+        for stem, per2 in _pass2_phyjudge(ds).items():
+            per1 = (p1.get(stem) or p1.get(stem.removesuffix("_result"))
+                    or p1.get(stem + "_result") or {})
+            jc = per1.get("clean")
+            if jc is None:
+                continue
+            for v, jv in per2.items():
+                if v == "clean":
+                    continue
+                rat = _phyjudge_rationale(ds, stem, v)
+                if not rat:
+                    continue
+                dJ = (jv - jc) / span
+                dvn = dv.get(ds, {}).get(stem, {}).get(v)
+                gap = dJ - dvn if dvn is not None else dJ
+                kind = "temporal" if v in TEMPORAL else "superficial"
+                rows.append(dict(stem=stem, dataset=ds, variant=v, kind=kind,
+                                 jc=round(jc, 3), jv=round(jv, 3),
+                                 dJ=round(dJ, 4), gap=round(gap, 4), rationale=rat))
+    rows.sort(key=lambda r: -abs(r["gap"]))
+    return rows[:n]
+
+
+def faithfulness_sample(coder="fs1", n=5):
+    """Rate rationale faithfulness on the n highest-gameability-gap PhyJudge
+    Pass-2 cases (largest |dJ - dV|), judged against the observed score move."""
+    import ipywidgets as W
+    from IPython.display import display
+
+    rows = _pass2_gap_cases(n)
+    if not rows:
+        print("no PhyJudge Pass-2 records with a rationale found.")
+        return
+    key = _SAMPLE_KEY.format(coder=coder)
+    TMP.mkdir(parents=True, exist_ok=True)
+    path = TMP / f"faith_sample__{coder}.jsonl"
+    done = {}
+    if _exists(key):
+        for ln in _get_text(key).splitlines():
+            if ln.strip():
+                r = json.loads(ln)
+                done[(r["stem"], r["variant"])] = r
+    if not path.exists() and done:
+        path.write_text("\n".join(json.dumps(v) for v in done.values()) + "\n")
+
+    st = {"i": next((k for k, r in enumerate(rows)
+                     if (r["stem"], r["variant"]) not in done), len(rows))}
+    head, vids, ctx, rat = W.HTML(), W.HTML(), W.HTML(), W.HTML()
+    out = W.RadioButtons(options=[(d, k) for k, d in FAITH_OUTCOMES],
+                         layout=W.Layout(width="95%"))
+    note = W.Textarea(layout=W.Layout(width="95%", height="55px"))
+    back = W.Button(description="< Back")
+    subm = W.Button(description="Submit >", button_style="primary")
+    msg = W.HTML()
+    display(W.VBox([head, vids, ctx, W.HTML("<b>PhyJudge Pass-2 rationale</b>"),
+                    rat, W.HTML("<b>Faithful to the observed behaviour?</b>"),
+                    out, note, W.HBox([back, subm]), msg]))
+
+    def render():
+        i = st["i"]
+        if i >= len(rows):
+            head.value = "<h3>Done.</h3>"
+            out.disabled = note.disabled = subm.disabled = True
+            msg.value = f"{len(rows)} -> s3://{BUCKET}/{key}"
+            return
+        r = rows[i]
+        move = r["jv"] - r["jc"]
+        obs = (f"{r['kind']} attack; PhyJudge score "
+               f"{'ROSE' if move > 0.1 else 'DROPPED' if move < -0.1 else 'held'} "
+               f"{move:+.2f} (clean {r['jc']} -> {r['variant']} {r['jv']}), "
+               f"gap d=dJ-dV {r['gap']:+.3f}")
+        head.value = (f"<h3>{i+1}/{len(rows)} &nbsp; "
+                      f"<code>{r['stem'][:40]} / {r['variant']}</code></h3>")
+        cp = _download(_clean_key({"dataset": r["dataset"], "stem": r["stem"],
+                                  "source_key": _resolve_source(r["dataset"], r["stem"])}))
+        vp = _download(_clip_key(r["dataset"], r["stem"], r["variant"]))
+        vids.value = _video_html(cp, "clean") + _video_html(vp, r["variant"])
+        ctx.value = f"<div style='font:13px sans-serif'>observed: <b>{obs}</b></div>"
+        rat.value = (f"<pre style='white-space:pre-wrap;font:12px monospace'>"
+                     f"{r['rationale']}</pre>")
+        prev = done.get((r["stem"], r["variant"]))
+        out.value = prev["faithfulness"] if prev else None
+        note.value = prev.get("note", "") if prev else ""
+        msg.value = "<i>revising</i>" if prev else ""
+
+    def on_submit(_):
+        r = rows[st["i"]]
+        if out.value is None:
+            msg.value = "<span style='color:#c00'>pick one</span>"
+            return
+        done[(r["stem"], r["variant"])] = dict(
+            coder=coder, stem=r["stem"], dataset=r["dataset"],
+            variant=r["variant"], kind=r["kind"], gap=r["gap"],
+            observed_move=round(r["jv"] - r["jc"], 3),
+            faithfulness=out.value, note=note.value.strip(),
+            ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        path.write_text("\n".join(json.dumps(v) for v in done.values()) + "\n")
+        _UPLOAD.submit(lambda: s3.put_object(Bucket=BUCKET, Key=key,
+                                             Body=path.read_bytes()))
+        st["i"] += 1
+        render()
+
+    def on_back(_):
+        st["i"] = max(0, st["i"] - 1)
+        render()
+
+    subm.on_click(on_submit)
+    back.on_click(on_back)
+    render()
+
+
+def faithfulness_sample_report(coders=None):
+    keys = [k for k in _list("case_faithfulness_sample/") if k.endswith(".jsonl")]
+    recs = []
+    for k in keys:
+        for ln in _get_text(k).splitlines():
+            if ln.strip():
+                recs.append(json.loads(ln))
+    if coders:
+        recs = [r for r in recs if r["coder"] in coders]
+    if not recs:
+        print("no case_faithfulness_sample records.")
+        return {}
+    by = Counter(r["faithfulness"] for r in recs)
+    n = len(recs)
+    print(f"== {n} PhyJudge Pass-2 gap-ranked cases (single judgement) ==")
+    for k in FAITH_KEYS:
+        print(f"  {k:12s} {by[k]:3d}  ({by[k]/n:.0%})")
+    for r in recs:
+        if r["faithfulness"] in ("unfaithful", "partial"):
+            print(f"  {r['stem'][:36]}/{r['variant']}  move {r['observed_move']:+.2f}"
+                  f"  -> {r['faithfulness']}  {r.get('note','')[:80]}")
+    return {"n": n, "dist": dict(by),
+            "unfaithful_rate": (by["unfaithful"] + by["partial"]) / n}
+
+
 def adjudicate(version="v1", adjudicator="adj"):
     """Third pass over disagreements only."""
     import ipywidgets as W
