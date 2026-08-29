@@ -657,25 +657,25 @@ def report(version="v1"):
         labs = [by_coder[c][cid]["failure_mode"] for c in coders if cid in by_coder[c]]
         if len(labs) < 2:
             continue
-        top, cnt = Counter(labs).most_common(1)[0]
-        if cnt == len(labs):
+        cnt = Counter(labs)
+        top_n = cnt.most_common(1)[0][1]
+        if top_n == len(labs):
             unan += 1
-        elif cnt >= need:
+        elif top_n * 2 > len(labs):
             maj += 1
         else:
             nomaj += 1
             splits.append((cid, labs))
     print(f"\n== per-case consensus ==")
-    print(f"  unanimous {unan}   majority (>= {need}/{len(coders)}) {maj}   "
-          f"no majority {nomaj}")
+    print(f"  unanimous {unan}   plurality/majority {maj}   "
+          f"exact tie (auto-broken by mode priority) {nomaj}")
     for cid, labs in splits:
-        print(f"  NO MAJORITY {cid}")
+        print(f"  TIE {cid}: {' / '.join(labs)}")
         for c in coders:
-            if cid in by_coder[c]:
-                print(f"     {c}: {by_coder[c][cid]['failure_mode']:26s} "
-                      f"| {by_coder[c][cid].get('note', '')[:70]}")
+            if cid in by_coder[c] and by_coder[c][cid].get("note"):
+                print(f"     {c}: {by_coder[c][cid]['note'][:80]}")
 
-    print("\n== failure-mode distribution (majority / adjudicated label) ==")
+    print("\n== failure-mode distribution (final label: adjudicated > plurality) ==")
     fin = final_labels(version)
     _dist([dict(cases[cid], failure_mode=fin[cid]["failure_mode"])
            for cid in cases if cid in fin], cases, from_final=True)
@@ -704,9 +704,9 @@ def _dist(recs, cases, from_final=False):
 
 
 def final_labels(version="v1"):
-    """Per case: adjudicated label if one exists, else the MAJORITY label
-    (>= ceil(n_coders / 2) agree). No-majority cases are omitted -- resolve
-    them with adjudicate()."""
+    """Per case: adjudicated label if one exists, else the PLURALITY label
+    (the mode of the coders' picks). An exact tie (e.g. 1-1-1) is broken
+    deterministically by FM_KEYS order; `source` records which case it was."""
     recs = load_codes(version)
     by_coder = defaultdict(dict)
     adj = {}
@@ -716,7 +716,6 @@ def final_labels(version="v1"):
         else:
             by_coder[r["coder"]][r["case_id"]] = r
     coders = sorted(by_coder)
-    need = max(2, len(coders) // 2 + 1)
     out = {}
     for cid in {cid for d in by_coder.values() for cid in d}:
         if cid in adj:
@@ -725,11 +724,15 @@ def final_labels(version="v1"):
         labs = [by_coder[c][cid]["failure_mode"] for c in coders if cid in by_coder[c]]
         if not labs:
             continue
-        top, cnt = Counter(labs).most_common(1)[0]
-        if cnt >= min(need, len(labs)) and cnt > len(labs) / 2:
-            out[cid] = {"case_id": cid, "failure_mode": top,
-                        "source": "unanimous" if cnt == len(labs) else "majority",
-                        "n_agree": cnt, "n_coders": len(labs)}
+        cnt = Counter(labs)
+        top_n = cnt.most_common(1)[0][1]
+        tied = sorted((m for m in cnt if cnt[m] == top_n),
+                      key=lambda m: FM_KEYS.index(m) if m in FM_KEYS else 99)
+        pick = tied[0]
+        src = ("unanimous" if top_n == len(labs)
+               else "plurality" if len(tied) == 1 else "tie_broken")
+        out[cid] = {"case_id": cid, "failure_mode": pick, "source": src,
+                    "n_agree": top_n, "n_coders": len(labs)}
     return out
 
 
