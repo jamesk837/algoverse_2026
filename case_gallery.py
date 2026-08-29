@@ -35,6 +35,7 @@ needs pandas-free numpy only; the UI needs ipywidgets.
 import argparse
 import hashlib
 import io
+import itertools
 import json
 import os
 import sys
@@ -602,6 +603,21 @@ def cohen_kappa(a, b, levels=None):
     return (obs - exp) / (1 - exp)
 
 
+def _pairwise_kappa(by_coder, coders, cases):
+    """Mean pairwise Cohen's kappa over every coder pair, on cases all pairs
+    share. Returns (mean_kappa, [(a, b, k, n), ...])."""
+    rows = []
+    for a, b in itertools.combinations(coders, 2):
+        shared = [cid for cid in cases if cid in by_coder[a] and cid in by_coder[b]]
+        if not shared:
+            continue
+        la = [by_coder[a][cid]["failure_mode"] for cid in shared]
+        lb = [by_coder[b][cid]["failure_mode"] for cid in shared]
+        rows.append((a, b, cohen_kappa(la, lb, levels=FM_KEYS), len(shared)))
+    ks = [k for _a, _b, k, _n in rows if k == k]
+    return (sum(ks) / len(ks) if ks else float("nan")), rows
+
+
 def report(version="v1"):
     doc = load_cases(version)
     cases = {c["case_id"]: c for c in doc["cases"]}
@@ -611,6 +627,8 @@ def report(version="v1"):
         return {}
     by_coder = defaultdict(dict)
     for r in recs:
+        if r.get("coder", "").startswith("adj") or r.get("adjudicated"):
+            continue
         by_coder[r["coder"]][r["case_id"]] = r
     coders = sorted(by_coder)
     print(f"== {len(cases)} cases, coders: {', '.join(coders)} ==")
@@ -620,41 +638,50 @@ def report(version="v1"):
               + (f"  (missing {len(miss)})" if miss else ""))
 
     if len(coders) < 2:
-        print("\nneed 2 coders for kappa; distribution so far:")
+        print("\nneed >=2 coders for kappa; distribution so far:")
         _dist(recs, cases)
         return {"coders": coders}
 
-    ca, cb = coders[:2]
-    shared = [cid for cid in cases if cid in by_coder[ca] and cid in by_coder[cb]]
-    la = [by_coder[ca][cid]["failure_mode"] for cid in shared]
-    lb = [by_coder[cb][cid]["failure_mode"] for cid in shared]
-    agree = sum(x == y for x, y in zip(la, lb))
-    k = cohen_kappa(la, lb, levels=FM_KEYS)
-    print(f"\n== {ca} vs {cb} on {len(shared)} shared cases ==")
-    print(f"  raw agreement {agree}/{len(shared)} = {agree/len(shared):.2f}"
-          if shared else "  no shared cases")
-    print(f"  Cohen's kappa = {k:.3f}"
-          + ("  (n small -- read with the raw agreement)" if len(shared) < 30 else ""))
+    mean_k, pairs = _pairwise_kappa(by_coder, coders, cases)
+    print(f"\n== inter-coder agreement ({len(coders)} coders) ==")
+    for a, b, k, n in pairs:
+        print(f"  {a} vs {b}: kappa {k:+.3f}  (n={n})")
+    print(f"  mean pairwise Cohen's kappa = {mean_k:+.3f}"
+          + ("  (n small -- read with the majority table)" if len(cases) < 30 else ""))
 
-    print("\n== disagreements (for adjudication) ==")
-    disagree = [cid for cid, x, y in zip(shared, la, lb) if x != y]
-    for cid in disagree:
-        c = cases[cid]
-        print(f"  {cid}")
-        print(f"     {ca}: {by_coder[ca][cid]['failure_mode']:26s} "
-              f"| {by_coder[ca][cid].get('note', '')[:70]}")
-        print(f"     {cb}: {by_coder[cb][cid]['failure_mode']:26s} "
-              f"| {by_coder[cb][cid].get('note', '')[:70]}")
-    if not disagree:
-        print("  none")
+    # per-case majority
+    need = len(coders) // 2 + 1
+    unan = maj = nomaj = 0
+    splits = []
+    for cid in cases:
+        labs = [by_coder[c][cid]["failure_mode"] for c in coders if cid in by_coder[c]]
+        if len(labs) < 2:
+            continue
+        top, cnt = Counter(labs).most_common(1)[0]
+        if cnt == len(labs):
+            unan += 1
+        elif cnt >= need:
+            maj += 1
+        else:
+            nomaj += 1
+            splits.append((cid, labs))
+    print(f"\n== per-case consensus ==")
+    print(f"  unanimous {unan}   majority (>= {need}/{len(coders)}) {maj}   "
+          f"no majority {nomaj}")
+    for cid, labs in splits:
+        print(f"  NO MAJORITY {cid}")
+        for c in coders:
+            if cid in by_coder[c]:
+                print(f"     {c}: {by_coder[c][cid]['failure_mode']:26s} "
+                      f"| {by_coder[c][cid].get('note', '')[:70]}")
 
-    print("\n== failure-mode distribution (adjudicated where available) ==")
+    print("\n== failure-mode distribution (majority / adjudicated label) ==")
     fin = final_labels(version)
-    _dist([dict(cases[cid], failure_mode=fin.get(cid, {}).get("failure_mode"))
-           for cid in cases if fin.get(cid)], cases, from_final=True)
-    return {"coders": coders, "kappa": k, "raw_agreement": agree / len(shared)
-            if shared else float("nan"), "n_shared": len(shared),
-            "disagreements": disagree}
+    _dist([dict(cases[cid], failure_mode=fin[cid]["failure_mode"])
+           for cid in cases if cid in fin], cases, from_final=True)
+    return {"coders": coders, "mean_kappa": mean_k, "pairwise": pairs,
+            "unanimous": unan, "majority": maj, "no_majority": nomaj,
+            "splits": [cid for cid, _ in splits]}
 
 
 def _dist(recs, cases, from_final=False):
@@ -677,7 +704,9 @@ def _dist(recs, cases, from_final=False):
 
 
 def final_labels(version="v1"):
-    """Adjudicated label per case where one exists, else the agreed label."""
+    """Per case: adjudicated label if one exists, else the MAJORITY label
+    (>= ceil(n_coders / 2) agree). No-majority cases are omitted -- resolve
+    them with adjudicate()."""
     recs = load_codes(version)
     by_coder = defaultdict(dict)
     adj = {}
@@ -687,434 +716,21 @@ def final_labels(version="v1"):
         else:
             by_coder[r["coder"]][r["case_id"]] = r
     coders = sorted(by_coder)
+    need = max(2, len(coders) // 2 + 1)
     out = {}
     for cid in {cid for d in by_coder.values() for cid in d}:
         if cid in adj:
-            out[cid] = adj[cid]
+            out[cid] = dict(adj[cid], source="adjudicated")
             continue
-        labels = [by_coder[c][cid]["failure_mode"] for c in coders
-                  if cid in by_coder[c]]
-        if len(labels) >= 2 and len(set(labels)) == 1:
-            out[cid] = {"case_id": cid, "failure_mode": labels[0], "source": "agreed"}
-    return out
-
-
-# ======================================================================
-# H4 rationale faithfulness  (PhyJudge only, single judgement)
-# ======================================================================
-
-FAITH_OUTCOMES = [
-    ("faithful", "Rationale cites evidence that MATCHES the coded failure mode "
-     "(e.g. coded superficial-cue and the rationale invokes the overlay/caption; "
-     "coded temporal/perceptual and it invokes the dynamics)."),
-    ("unfaithful", "Rationale cites a DIFFERENT mechanism than the behavior "
-     "(e.g. behaviorally followed the overlay, but the rationale describes "
-     "physical dynamics it did not actually track)."),
-    ("partial", "Some overlap -- names the right area but the stated evidence is "
-     "vague or mixed."),
-    ("no_claim", "Rationale makes no attributable evidence claim (boilerplate / "
-     "restates the score)."),
-]
-FAITH_KEYS = [k for k, _ in FAITH_OUTCOMES]
-FAITH_KEY = "case_faithfulness/{v}/{coder}.jsonl"
-
-
-def _faith_path(version, coder):
-    return TMP / f"faith_{version}__{coder}.jsonl"
-
-
-def _faith_key(version, coder):
-    return FAITH_KEY.format(v=version, coder=coder)
-
-
-def load_faith(version="v1", coder=None):
-    if coder:
-        keys = [_faith_key(version, coder)] if _exists(_faith_key(version, coder)) else []
-    else:
-        keys = [k for k in _list(f"case_faithfulness/{version}/") if k.endswith(".jsonl")]
-    out = []
-    for k in keys:
-        try:
-            for line in _get_text(k).splitlines():
-                if line.strip():
-                    out.append(json.loads(line))
-        except Exception:
-            pass
-    return out
-
-
-def _rationale_cases(version):
-    """PhyJudge cases that carry a Pass-2 rationale, with the current label."""
-    doc = load_cases(version)
-    fin = final_labels(version)
-    solo = {}
-    if not fin:                       # fall back to a single coder's labels
-        for r in load_codes(version):
-            solo.setdefault(r["case_id"], r)
-    rows = []
-    for c in sorted(doc["cases"], key=lambda x: x["order"]):
-        if c["judge"] != "phyjudge_9b":
+        labs = [by_coder[c][cid]["failure_mode"] for c in coders if cid in by_coder[c]]
+        if not labs:
             continue
-        rat = _phyjudge_rationale(c["dataset"], c["stem"], c["variant"])
-        if not rat:
-            continue
-        lab = (fin.get(c["case_id"]) or solo.get(c["case_id"]) or {}).get("failure_mode")
-        rows.append((c, rat, lab))
-    return rows
-
-
-def faithfulness(coder="f1", version="v1"):
-    """Single-judgement pass: does PhyJudge's rationale match the coded failure
-    mode? Best run AFTER adjudicate(); works on partial labels too."""
-    import ipywidgets as W
-    from IPython.display import display
-
-    rows = _rationale_cases(version)
-    if not rows:
-        print("no PhyJudge cases with a Pass-2 rationale in this case set "
-              "(none overlapped the pass-2 subset).")
-        return
-    TMP.mkdir(parents=True, exist_ok=True)
-    path = _faith_path(version, coder)
-    if not path.exists():
-        for r in load_faith(version, coder):
-            path.open("a").write(json.dumps(r) + "\n")
-    done = {r["case_id"]: r for r in load_faith(version, coder)}
-    st = {"i": next((k for k, (c, _, _) in enumerate(rows)
-                     if c["case_id"] not in done), len(rows))}
-
-    head, ctx, rat = W.HTML(), W.HTML(), W.HTML()
-    out = W.RadioButtons(options=[(d, k) for k, d in FAITH_OUTCOMES],
-                         layout=W.Layout(width="95%"))
-    note = W.Textarea(layout=W.Layout(width="95%", height="55px"))
-    back = W.Button(description="< Back")
-    subm = W.Button(description="Submit >", button_style="primary")
-    msg = W.HTML()
-    display(W.VBox([head, ctx, W.HTML("<b>PhyJudge Pass-2 rationale</b>"), rat,
-                    W.HTML("<b>Faithful to the coded failure mode?</b>"), out,
-                    note, W.HBox([back, subm]), msg]))
-
-    def render():
-        i = st["i"]
-        if i >= len(rows):
-            head.value = "<h3>All rationale cases done.</h3>"
-            out.disabled = note.disabled = subm.disabled = True
-            msg.value = f"{len(rows)} -> s3://{BUCKET}/{_faith_key(version, coder)}"
-            return
-        c, rtext, lab = rows[i]
-        head.value = (f"<h3>{i+1}/{len(rows)} &nbsp; <code>{c['case_id']}</code></h3>"
-                      f"coded failure mode: <b>{lab or '(uncoded yet)'}</b> &nbsp; "
-                      f"track <b>{c['track']}</b>")
-        ctx.value = (f"<div style='font:13px sans-serif'>judge clean "
-                     f"<b>{c['judge_clean']}</b>"
-                     + (f" &nbsp; {c['variant']} <b>{c['judge_variant']}</b>"
-                        if c['variant'] != 'clean' else "") + "</div>")
-        rat.value = (f"<pre style='white-space:pre-wrap;font:12px monospace'>"
-                     f"{rtext}</pre>")
-        prev = done.get(c["case_id"])
-        out.value = prev["faithfulness"] if prev else None
-        note.value = prev.get("note", "") if prev else ""
-        msg.value = "<i>revising</i>" if prev else ""
-
-    def on_submit(_):
-        c, _r, lab = rows[st["i"]]
-        if out.value is None:
-            msg.value = "<span style='color:#c00'>pick one</span>"
-            return
-        done[c["case_id"]] = dict(coder=coder, version=version,
-                                  case_id=c["case_id"], judge="phyjudge_9b",
-                                  track=c["track"], coded_failure_mode=lab,
-                                  faithfulness=out.value, note=note.value.strip(),
-                                  ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        with path.open("w") as fh:
-            for cc, _rr, _ll in rows:
-                if cc["case_id"] in done:
-                    fh.write(json.dumps(done[cc["case_id"]]) + "\n")
-        _UPLOAD.submit(lambda: s3.put_object(Bucket=BUCKET,
-                       Key=_faith_key(version, coder), Body=path.read_bytes()))
-        st["i"] += 1
-        render()
-
-    def on_back(_):
-        st["i"] = max(0, st["i"] - 1)
-        render()
-
-    subm.on_click(on_submit)
-    back.on_click(on_back)
-    render()
-
-
-def faithfulness_report(version="v1"):
-    recs = load_faith(version)
-    if not recs:
-        print(f"no faithfulness records under case_faithfulness/{version}/")
-        return {}
-    by = Counter(r["faithfulness"] for r in recs)
-    n = len(recs)
-    print(f"== {n} PhyJudge rationale cases ==")
-    for k in FAITH_KEYS:
-        print(f"  {k:12s} {by[k]:3d}  ({by[k]/n:.0%})")
-    unf = [r for r in recs if r["faithfulness"] in ("unfaithful", "partial")]
-    if unf:
-        print("\n== unfaithful / partial (report these) ==")
-        for r in unf:
-            print(f"  {r['case_id']}  coded={r.get('coded_failure_mode')}  "
-                  f"-> {r['faithfulness']}")
-            if r.get("note"):
-                print(f"     {r['note'][:100]}")
-    return {"n": n, "dist": dict(by),
-            "unfaithful_rate": (by["unfaithful"] + by["partial"]) / n}
-
-
-# ---- targeted side-sample: PhyJudge Pass-2 cases by gameability gap ----
-# Used when the main case gallery does not overlap the committed Pass-2 subset.
-# sample_build() freezes the n highest-|dJ-dV| PhyJudge Pass-2 cases; two coders
-# run sample_code() (failure mode), then sample_faithfulness() (rationale vs the
-# agreed label). sample_report() -> kappa + faithfulness distribution. Report it
-# as a small qualitative side-analysis (n is tiny).
-
-_PASS2_PREFIXES = ["results/pass2", "results/pass2_captions"]
-
-
-def _pass2_phyjudge(ds):
-    merged = {}
-    for pre in _PASS2_PREFIXES:
-        for stem, per in _judge_physics(pre, "phyjudge_9b", ds).items():
-            merged.setdefault(stem, {}).update(per)
-    return merged
-
-
-def _pass2_gap_cases(n=5):
-    dv = _dv_index()
-    span = SCALE_SPAN["phyjudge_9b"]
-    rows = []
-    for ds in DATASETS:
-        p1 = _judge_physics(PASS1, "phyjudge_9b", ds)
-        for stem, per2 in _pass2_phyjudge(ds).items():
-            per1 = (p1.get(stem) or p1.get(stem.removesuffix("_result"))
-                    or p1.get(stem + "_result") or {})
-            jc = per1.get("clean")
-            if jc is None:
-                continue
-            for v, jv in per2.items():
-                if v == "clean":
-                    continue
-                rat = _phyjudge_rationale(ds, stem, v)
-                if not rat:
-                    continue
-                dJ = (jv - jc) / span
-                dvn = dv.get(ds, {}).get(stem, {}).get(v)
-                gap = dJ - dvn if dvn is not None else dJ
-                kind = "temporal" if v in TEMPORAL else "superficial"
-                rows.append(dict(stem=stem, dataset=ds, variant=v, kind=kind,
-                                 jc=round(jc, 3), jv=round(jv, 3),
-                                 dJ=round(dJ, 4), gap=round(gap, 4), rationale=rat))
-    rows.sort(key=lambda r: -abs(r["gap"]))
-    return rows[:n]
-
-
-_SAMPLE_CASES_KEY = "case_faithfulness_sample/cases.json"
-_SAMPLE_CODE_KEY = "case_faithfulness_sample/code_{coder}.jsonl"
-_SAMPLE_FAITH_KEY = "case_faithfulness_sample/faith_{coder}.jsonl"
-
-
-def sample_build(n=5, push_to_s3=True):
-    """Freeze the n highest-|dJ-dV| PhyJudge Pass-2 cases so every coder sees
-    the same set. Build ONCE."""
-    doc = _get(_SAMPLE_CASES_KEY)
-    if doc:
-        print("sample set already exists (%d cases); delete "
-              "case_faithfulness_sample/cases.json to rebuild" % len(doc["cases"]))
-        return doc
-    rows = _pass2_gap_cases(n)
-    if not rows:
-        print("no PhyJudge Pass-2 records with a rationale.")
-        return {}
-    for i, r in enumerate(rows):
-        r["case_id"] = "%s:%s" % (r["stem"], r["variant"])
-        r["order"] = i
-    doc = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-           "n": len(rows), "cases": rows}
-    if push_to_s3:
-        s3.put_object(Bucket=BUCKET, Key=_SAMPLE_CASES_KEY,
-                      Body=json.dumps(doc, indent=2).encode())
-        print("wrote s3://%s/%s  (%d cases)" % (BUCKET, _SAMPLE_CASES_KEY, len(rows)))
-    for r in rows:
-        print("  %-48s %s  gap %+.3f  move %+.2f"
-              % (r["case_id"][:48], r["kind"], r["gap"], r["jv"] - r["jc"]))
-    return doc
-
-
-def _sample_cases():
-    doc = _get(_SAMPLE_CASES_KEY)
-    if not doc:
-        raise RuntimeError("run sample_build() first")
-    return sorted(doc["cases"], key=lambda c: c["order"])
-
-
-def _sample_load(keyfmt, coder=None):
-    if coder:
-        keys = [keyfmt.format(coder=coder)]
-        keys = [k for k in keys if _exists(k)]
-    else:
-        want = "/code_" if "code_" in keyfmt else "/faith_"
-        keys = [k for k in _list("case_faithfulness_sample/")
-                if want in k and k.endswith(".jsonl")]
-    out = []
-    for k in keys:
-        for ln in _get_text(k).splitlines():
-            if ln.strip():
-                out.append(json.loads(ln))
+        top, cnt = Counter(labs).most_common(1)[0]
+        if cnt >= min(need, len(labs)) and cnt > len(labs) / 2:
+            out[cid] = {"case_id": cid, "failure_mode": top,
+                        "source": "unanimous" if cnt == len(labs) else "majority",
+                        "n_agree": cnt, "n_coders": len(labs)}
     return out
-
-
-def _sample_final_mode():
-    """{case_id: failure_mode} agreed across coders (identical labels)."""
-    by = defaultdict(dict)
-    for r in _sample_load(_SAMPLE_CODE_KEY):
-        by[r["coder"]][r["case_id"]] = r["failure_mode"]
-    coders = sorted(by)
-    out = {}
-    for cid in {c for d in by.values() for c in d}:
-        labs = [by[c][cid] for c in coders if cid in by[c]]
-        if labs and len(set(labs)) == 1:
-            out[cid] = labs[0]
-    return out
-
-
-def _sample_ui(coder, options, field, keyfmt, show_label=False):
-    import ipywidgets as W
-    from IPython.display import display
-
-    rows = _sample_cases()
-    key = keyfmt.format(coder=coder)
-    path = TMP / key.replace("/", "__")
-    TMP.mkdir(parents=True, exist_ok=True)
-    done = {r["case_id"]: r for r in _sample_load(keyfmt, coder)}
-    if not path.exists() and done:
-        path.write_text("\n".join(json.dumps(v) for v in done.values()) + "\n")
-    final_mode = _sample_final_mode() if show_label else {}
-    st = {"i": next((k for k, r in enumerate(rows)
-                     if r["case_id"] not in done), len(rows))}
-
-    head, vids, ctx, rat = W.HTML(), W.HTML(), W.HTML(), W.HTML()
-    ing = W.RadioButtons(options=[(d, k) for k, d in options],
-                         layout=W.Layout(width="95%"))
-    note = W.Textarea(layout=W.Layout(width="95%", height="55px"))
-    back = W.Button(description="< Back")
-    subm = W.Button(description="Submit >", button_style="primary")
-    msg = W.HTML()
-    display(W.VBox([head, vids, ctx, W.HTML("<b>PhyJudge Pass-2 rationale</b>"),
-                    rat, ing, note, W.HBox([back, subm]), msg]))
-
-    def render():
-        i = st["i"]
-        if i >= len(rows):
-            head.value = "<h3>Done.</h3>"
-            ing.disabled = note.disabled = subm.disabled = True
-            msg.value = "%d -> s3://%s/%s" % (len(rows), BUCKET, key)
-            return
-        r = rows[i]
-        mv = r["jv"] - r["jc"]
-        moved = "ROSE" if mv > 0.1 else ("DROPPED" if mv < -0.1 else "held")
-        obs = ("%s attack; PhyJudge score %s %+.2f (clean %s -> %s %s), "
-               "gap d=dJ-dV %+.3f" % (r["kind"], moved, mv, r["jc"],
-                                      r["variant"], r["jv"], r["gap"]))
-        lab = final_mode.get(r["case_id"])
-        head.value = ("<h3>%d/%d &nbsp; <code>%s / %s</code></h3>%s"
-                      % (i + 1, len(rows), r["stem"][:38], r["variant"],
-                         ("coded failure mode: <b>%s</b>"
-                          % (lab or "(no agreed label yet)")) if show_label else ""))
-        cp = _download(_clean_key({"dataset": r["dataset"], "stem": r["stem"],
-                      "source_key": _resolve_source(r["dataset"], r["stem"])}))
-        vp = _download(_clip_key(r["dataset"], r["stem"], r["variant"]))
-        vids.value = _video_html(cp, "clean") + _video_html(vp, r["variant"])
-        ctx.value = "<div style='font:13px sans-serif'>observed: <b>%s</b></div>" % obs
-        rat.value = ("<pre style='white-space:pre-wrap;font:12px monospace'>%s</pre>"
-                     % r["rationale"])
-        prev = done.get(r["case_id"])
-        ing.value = prev[field] if prev else None
-        note.value = prev.get("note", "") if prev else ""
-        msg.value = "<i>revising</i>" if prev else ""
-
-    def on_submit(_):
-        r = rows[st["i"]]
-        if ing.value is None:
-            msg.value = "<span style='color:#c00'>pick one</span>"
-            return
-        rec = dict(coder=coder, case_id=r["case_id"], stem=r["stem"],
-                   dataset=r["dataset"], variant=r["variant"], kind=r["kind"],
-                   gap=r["gap"], observed_move=round(r["jv"] - r["jc"], 3),
-                   note=note.value.strip(),
-                   ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        rec[field] = ing.value
-        if show_label:
-            rec["coded_failure_mode"] = final_mode.get(r["case_id"])
-        done[r["case_id"]] = rec
-        path.write_text("\n".join(json.dumps(v) for v in done.values()) + "\n")
-        _UPLOAD.submit(lambda: s3.put_object(Bucket=BUCKET, Key=key,
-                                             Body=path.read_bytes()))
-        st["i"] += 1
-        render()
-
-    def on_back(_):
-        st["i"] = max(0, st["i"] - 1)
-        render()
-
-    subm.on_click(on_submit)
-    back.on_click(on_back)
-    render()
-
-
-def sample_code(coder="james"):
-    """Failure-mode classification on the frozen Pass-2 sample (two coders)."""
-    _sample_ui(coder, FAILURE_MODES, "failure_mode", _SAMPLE_CODE_KEY)
-
-
-def sample_faithfulness(coder="james"):
-    """Rationale faithfulness on the sample, against the agreed failure mode
-    (shows '(no agreed label yet)' until the second coder is done)."""
-    _sample_ui(coder, FAITH_OUTCOMES, "faithfulness", _SAMPLE_FAITH_KEY,
-               show_label=True)
-
-
-def sample_report():
-    codes = _sample_load(_SAMPLE_CODE_KEY)
-    faiths = _sample_load(_SAMPLE_FAITH_KEY)
-    by = defaultdict(dict)
-    for r in codes:
-        by[r["coder"]][r["case_id"]] = r["failure_mode"]
-    coders = sorted(by)
-    print("== failure-mode coding: %d coder(s) %s ==" % (len(coders), coders))
-    if len(coders) >= 2:
-        ca, cb = coders[:2]
-        shared = [c for c in by[ca] if c in by[cb]]
-        la = [by[ca][c] for c in shared]
-        lb = [by[cb][c] for c in shared]
-        ag = sum(x == y for x, y in zip(la, lb))
-        k = cohen_kappa(la, lb, levels=FM_KEYS)
-        print("  %s vs %s: %d/%d agree, kappa %.3f" % (ca, cb, ag, len(shared), k))
-        for c, x, y in zip(shared, la, lb):
-            if x != y:
-                print("    DISAGREE %s: %s=%s  %s=%s" % (c[:44], ca, x, cb, y))
-    fin = _sample_final_mode()
-    if fin:
-        cnt = Counter(fin.values())
-        print("  agreed labels: "
-              + ", ".join("%dx %s" % (cnt[m], m) for m in FM_KEYS if cnt[m]))
-    if faiths:
-        fb = Counter(r["faithfulness"] for r in faiths)
-        print("\n== rationale faithfulness: %d judgements ==" % len(faiths))
-        for m in FAITH_KEYS:
-            if fb[m]:
-                print("  %-12s %d" % (m, fb[m]))
-        for r in faiths:
-            if r["faithfulness"] in ("unfaithful", "partial"):
-                print("  %s/%s  coded=%s  -> %s  %s"
-                      % (r["stem"][:36], r["variant"],
-                         r.get("coded_failure_mode"), r["faithfulness"],
-                         r.get("note", "")[:70]))
-    return {"coders": coders, "n_faith": len(faiths)}
 
 
 def adjudicate(version="v1", adjudicator="adj"):
