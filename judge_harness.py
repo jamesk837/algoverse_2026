@@ -222,12 +222,51 @@ ATTACK_FILES = [
 # Mirrors attack_suite.CONTROL_ATTACKS; edit the two together.
 CONTROL_FILES = ["identity"]
 
+# Overlay ablation (reviewer request, 2026-08-31). Two experiments, run on
+# the PASS-2 CLIP SUBSET (see attack_suite.pass2_stems): 120 clips that
+# already carry a full 2x2 pass-1 record and are the set the rationale coding
+# was done on.
+#
+# A -- MECHANISM ladder. caption_echo_* shows an overlay moves the judge;
+# these say WHY. All four are at the ORIGINAL centre placement, full opacity
+# and full size, so each is directly comparable to the caption_echo rows in
+# results/pass1, which are the ladder's top rungs and are not re-rendered.
+# Mirrors attack_suite.OVERLAY_MECHANISM; edit the two together.
+OVERLAY_MECHANISM_FILES = [
+    "overlay_blank",          # filled box, same dims + opacity, no glyphs
+    "overlay_random_chars",   # glyphs, no words
+    "overlay_georgian",       # the claim in a script the judges cannot read
+    "overlay_nonsense",       # readable English, no meaning
+]
+
+# Opt-in Ethiopic alternative to the georgian arm; needs a font with Ethiopic
+# coverage installed (DejaVuSans has none). Not in OVERLAY_FILES by default.
+OVERLAY_OPTIONAL_FILES = ["overlay_amharic"]
+
+# B -- PRESENTATION robustness: one caption (the selection loop's winner)
+# crossed over placement x opacity x size. DEFERRED until that winner is
+# known; populate from attack_suite.overlay_robustness_set(text, label) and
+# mirror the generated names here.
+OVERLAY_ROBUSTNESS_FILES = []
+
+OVERLAY_FILES = OVERLAY_MECHANISM_FILES + OVERLAY_ROBUSTNESS_FILES
+
+# Caption-search variants are named `search_<hash of the text>` and the set is
+# DYNAMIC by design -- a human writes new phrases between rounds -- so they
+# cannot be enumerated here the way every other variant is. `variants=`
+# therefore accepts any name with this prefix. The hash is what keeps that
+# safe: a name uniquely determines its text, so an unknown `search_*` can only
+# ever be a phrase this repo rendered, never a typo that silently scores the
+# wrong video. See attack_suite.search_pool for the text mapping.
+SEARCH_PREFIX = "search_"
+
 # VARIANTS is the experiment and stays the default run, so adding the control
-# does not retroactively mark every completed clip incomplete -- audit_runs,
-# check_results and monitor all measure against a list of this length.
-# ALL_VARIANTS is only what `variants=` is allowed to name.
+# or an ablation arm does not retroactively mark every completed clip
+# incomplete -- audit_runs, check_results and monitor all measure against a
+# list of this length. ALL_VARIANTS is only what `variants=` is allowed to
+# name; ablation arms are ALWAYS run by naming them explicitly.
 VARIANTS = ["clean"] + ATTACK_FILES
-ALL_VARIANTS = VARIANTS + CONTROL_FILES
+ALL_VARIANTS = VARIANTS + CONTROL_FILES + OVERLAY_FILES
 
 IMPLAUSIBENCH_FIXED_CAPTION = "the events in the video appear to follow physics principles"
 
@@ -1318,7 +1357,13 @@ def results_frame(records):
     # ALL_VARIANTS, not VARIANTS: pd.Categorical maps anything outside
     # `categories` to NaN, so an identity run would silently blank its own
     # variant column and sort into a single undifferentiated block.
-    df["variant"] = pd.Categorical(df["variant"], categories=ALL_VARIANTS,
+    # ALL_VARIANTS plus whatever searched captions actually appear: categories=
+    # maps anything outside the list to NaN, which would blank the variant
+    # column for an entire search round.
+    _cats = ALL_VARIANTS + sorted(
+        {v for v in df["variant"].unique() if isinstance(v, str)
+         and v.startswith(SEARCH_PREFIX)})
+    df["variant"] = pd.Categorical(df["variant"], categories=_cats,
                                    ordered=True)
     return df.sort_values(["clip", "model", "variant", "call"]).reset_index(drop=True)
 
@@ -1383,7 +1428,8 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
 
     if variants is not None:
         variants = list(variants)
-        unknown = [v for v in variants if v not in ALL_VARIANTS]
+        unknown = [v for v in variants if v not in ALL_VARIANTS
+                   and not v.startswith(SEARCH_PREFIX)]
         if unknown:
             raise ValueError(f"unknown variant(s) {unknown}; "
                              f"expected a subset of {ALL_VARIANTS}")

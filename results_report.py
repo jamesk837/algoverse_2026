@@ -96,6 +96,23 @@ PHYSICS_CALL = {
     "videophy2_auto": lambda c: c == "PC",
 }
 SCALE_SPAN = {"phyjudge_9b": 4.0, "vila_ewm": 1.0, "videophy2_auto": 4.0}
+# Native scale of each judge's PHYSICS construct group, for reporting a delta
+# in the judge's own units next to the normalised one. The three do not share
+# a scale and arguably do not share a semantics either, so an equal normalised
+# movement is not an equal behavioural movement: +0.05 normalised is 0.2 of a
+# PhyJudge law point but 5 percentage points of vila's pass rate. Every
+# normalised number in this document is therefore printed with its native
+# counterpart beside it.
+NATIVE_SCALE = {
+    "phyjudge_9b": dict(lo=1.0, hi=5.0, unit="law pts",
+                        what="mean of 13 physical-law scores, 1-5"),
+    "vila_ewm": dict(lo=0.0, hi=1.0, unit="pass frac",
+                     what="fraction of 5 physical-law yes/no calls with no "
+                          "violation found, 0-1"),
+    "videophy2_auto": dict(lo=1.0, hi=5.0, unit="PC pts",
+                           what="physical-commonsense score, 1-5"),
+}
+HUMAN_SCALE = dict(lo=1.0, hi=5.0, unit="PC pts", span=4.0)
 TEMPORAL = {"shuffle", "reverse", "freeze"}
 SUPERFICIAL = ["photometric", "caption_echo_rubric_vocab",
                "caption_echo_score_anchor_positive",
@@ -643,8 +660,12 @@ def section_step12_temporal(human, annot_version="v1"):
                 return float(np.mean(vals))
         return None
     L.append(f"- annotated base clips: {len(stems)}\n")
-    L.append("| judge | attack | dJ (norm) | dH (norm, /4) | index dJ−dH | 95% CI | n |")
-    L.append("|---|---|---|---|---|---|---|")
+    # native alongside normalised: the index is a difference of two normalised
+    # quantities and has no native form, but each component does, and the
+    # judges do not share a scale -- see the scale legend.
+    L.append("| judge | attack | dJ (norm) | dJ (native) | dH (norm, /4) | "
+             "dH (native, PC pts) | index dJ-dH | 95% CI | n |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
     verdict_rows = []
     for judge in JUDGES:
         span = SCALE_SPAN[judge]
@@ -674,7 +695,10 @@ def section_step12_temporal(human, annot_version="v1"):
             lo, hi = boot_ci(idx)
             flag = "  H1-POSITIVE" if lo > 0 else ""
             L.append(f"| {judge} | {v} | {np.mean(dJ_list):+.4f} | "
-                     f"{np.mean(dH_list):+.4f} | {np.mean(idx):+.4f} | "
+                     f"{np.mean(dJ_list) * span:+.4f} {_unit(judge)} | "
+                     f"{np.mean(dH_list):+.4f} | "
+                     f"{np.mean(dH_list) * HUMAN_SCALE['span']:+.4f} | "
+                     f"{np.mean(idx):+.4f} | "
                      f"[{lo:+.4f}, {hi:+.4f}] | {len(dJ_list)} |{flag}")
             verdict_rows.append((judge, v, np.mean(idx), lo, hi))
     L.append("\n_index > 0 with CI excluding 0 = the judge under-responds to a "
@@ -756,6 +780,69 @@ def section_step13():
 # Table 1 + H1-H4 verdict, from deltas.csv (analyze.py output)
 # ======================================================================
 
+def _native(judge, x_norm):
+    """A normalised delta back in the judge's own units."""
+    return None if x_norm is None else x_norm * SCALE_SPAN[judge]
+
+
+def _unit(judge):
+    return NATIVE_SCALE[judge]["unit"]
+
+
+def _both(judge, x_norm, digits=3):
+    """`+0.031 (+0.126 law pts)` -- the house format for this document."""
+    if x_norm is None or (isinstance(x_norm, float) and np.isnan(x_norm)):
+        return "--"
+    return (f"{x_norm:+.{digits}f} ({_native(judge, x_norm):+.{digits}f} "
+            f"{_unit(judge)})")
+
+
+def _scale_legend():
+    L = ["## Scale legend - native vs normalised\n",
+         "_Normalised = (native - lo) / (hi - lo). The three judges have "
+         "different native scales and arguably different semantics, so an "
+         "equal normalised movement is NOT an equal behavioural movement; "
+         "every normalised delta below is printed with its native counterpart "
+         "in brackets._\n",
+         "| judge | physics construct | native range | span | 1 normalised "
+         "unit = |", "|---|---|---|---|---|"]
+    for j in JUDGES:
+        m = NATIVE_SCALE[j]
+        L.append(f"| {j} | {m['what']} | {m['lo']:g}-{m['hi']:g} | "
+                 f"{SCALE_SPAN[j]:g} | {SCALE_SPAN[j]:g} {m['unit']} |")
+    L.append(f"| human (VideoPhy-2 PC) | annotator physical-commonsense "
+             f"rating, 1-5 | 1-5 | 4 | 4 PC pts |")
+    L.append("\n_dJ - dV and dJ - dH are differences of two normalised "
+             "quantities measured on different instruments, so the index "
+             "itself has no native form; its two components are each given "
+             "natively instead._\n")
+    return "\n".join(L) + "\n"
+
+
+def _native_dj(judge, ds, variant):
+    """Judge-side dJ in NATIVE units, from analyze.py's physics-group rows.
+
+    deltas.csv carries two kinds of row for the same (judge, dataset,
+    variant): the physics construct group, whose signed_delta is already in
+    the judge's own units, and `step12_<group>`, whose signed_delta is the
+    normalised gap against the V-JEPA reference. This reads the first.
+    """
+    for r in _read_deltas_csv():
+        if (r["judge"] == judge and r["dataset"] == ds
+                and r["variant"] == variant
+                and r["group"] == PHYS_GROUP.get(judge)):
+            return float(r["signed_delta"]), float(r["ci_lo"]), float(r["ci_hi"])
+    return None
+
+
+def _native_dj_cell(judge, ds, variant):
+    got = _native_dj(judge, ds, variant)
+    if not got:
+        return "--"
+    d, lo, hi = got
+    return f"{d:+.3f} [{lo:+.3f}, {hi:+.3f}]"
+
+
 def _read_deltas_csv():
     for cand in ("analysis/deltas.csv", "deltas.csv"):
         if os.path.exists(cand):
@@ -778,7 +865,7 @@ def section_step12(temporal_idx):
         return m
 
     L.append("### Table 1 - reference-relative gap  d = dJ - dV  "
-             "(per dataset, [95% CI])\n")
+             "(normalised, per dataset, [95% CI])\n")
     L.append("| judge | dataset | shuffle | freeze | caption_echo_rubric_vocab |")
     L.append("|---|---|---|---|---|")
     for judge in JUDGES:
@@ -791,8 +878,25 @@ def section_step12(temporal_idx):
                              if m else "--")
             L.append(f"| {judge} | {ds} | " + " | ".join(cells) + " |")
 
+    # The gap above is a difference of two normalised quantities and has no
+    # native form. Its judge-side component does, and a reader cannot size the
+    # gap without it -- +0.03 normalised is about a tenth of a PhyJudge law
+    # point but three percentage points of vila's pass rate.
+    L.append("\n### Table 1b - the same attacks as dJ alone, in each judge's "
+             "NATIVE units\n")
+    L.append("| judge | native scale | dataset | shuffle | freeze | "
+             "caption_echo_rubric_vocab |")
+    L.append("|---|---|---|---|---|---|")
+    for judge in JUDGES:
+        for ds in DATASETS:
+            cells = [_native_dj_cell(judge, ds, v) for v in T1]
+            L.append(f"| {judge} | {NATIVE_SCALE[judge]['lo']:g}-"
+                     f"{NATIVE_SCALE[judge]['hi']:g} {_unit(judge)} | {ds} | "
+                     + " | ".join(cells) + " |")
+
     L.append("\n### H2 - superficial-cue inflation index  d = dJ - dV  "
-             "(per dataset, * = 95% CI excludes 0)\n")
+             "(per dataset, * = 95% CI excludes 0; normalised, native in "
+             "brackets)\n")
     L.append("| judge | dataset | " + " | ".join(v.replace("caption_echo_", "")
                                                  for v in SUPERFICIAL) + " |")
     L.append("|" + "---|" * (len(SUPERFICIAL) + 2))
@@ -808,7 +912,8 @@ def section_step12(temporal_idx):
                 star = "*" if float(m["ci_lo"]) > 0 else ""
                 if star and ds == "test":
                     h2_judges.add(judge)
-                cells.append(f"{float(m['signed_delta']):+.3f}{star}")
+                cells.append(f"{float(m['signed_delta']):+.3f}{star} "
+                             f"({_native(judge, float(m['signed_delta'])):+.3f})")
             L.append(f"| {judge} | {ds} | " + " | ".join(cells) + " |")
 
     fam_judges = defaultdict(set)
@@ -821,7 +926,7 @@ def section_step12(temporal_idx):
                      or "none"))
 
     L.append("\n### H1 - temporal-insensitivity index  dJ - dH  "
-             "(annotated subset, n=60, [95% CI])\n")
+             "(annotated subset, n=60, normalised, [95% CI])\n")
     L.append("| judge | shuffle | reverse | freeze |")
     L.append("|---|---|---|---|")
     tix = defaultdict(dict)
@@ -1084,19 +1189,32 @@ def _by_level_judges():
     """Step 8 addendum: clean judge score stratified by human PC level (test)."""
     labs = human_labels()
     L = ["## Step 8 (cont.) - clean judge score by human PC level (test, "
-         "normalized)\n", "| human PC | " + " | ".join(JUDGES) + " |",
+         "normalised with native in brackets)\n",
+         "| human PC | " + " | ".join(f"{j} ({_unit(j)})" for j in JUDGES) + " |",
          "|" + "---|" * (len(JUDGES) + 1)]
     per = {j: defaultdict(list) for j in JUDGES}
+    nat = {j: defaultdict(list) for j in JUDGES}
     for judge in JUDGES:
         for stem, pv in load_pass("results/pass1", judge, "test",
                                   PHYS_GROUP_CALL[judge]).items():
             lab = _lab(labs, stem)
             if lab and "clean" in pv:
                 per[judge][lab[0]].append(_normphys(judge, pv["clean"]))
+                nat[judge][lab[0]].append(pv["clean"])
     for lvl in (1, 2, 3, 4, 5):
-        cells = [f"{np.mean(per[j][lvl]):.3f}" if per[j][lvl] else "--"
-                 for j in JUDGES]
+        cells = [f"{np.mean(per[j][lvl]):.3f} ({np.mean(nat[j][lvl]):.3f})"
+                 if per[j][lvl] else "--" for j in JUDGES]
         L.append(f"| {lvl} | " + " | ".join(cells) + " |")
+    # a level-mean SPAN is the number a reader compares across judges, and it
+    # is the one place where normalising actively misleads: vila's booleans
+    # give it a 0-1 scale where the other two have four points to move in
+    span_cells = []
+    for j in JUDGES:
+        vals = [np.mean(per[j][l]) for l in (1, 2, 3, 4, 5) if per[j][l]]
+        nvals = [np.mean(nat[j][l]) for l in (1, 2, 3, 4, 5) if nat[j][l]]
+        span_cells.append(f"{max(vals) - min(vals):.3f} "
+                          f"({max(nvals) - min(nvals):.3f})" if vals else "--")
+    L.append("| **span 1->5** | " + " | ".join(span_cells) + " |")
     return "\n".join(L) + "\n"
 
 
@@ -1125,6 +1243,22 @@ def _reliability_cards(temporal_idx):
     return "\n".join(L) + "\n"
 
 
+def section_select_loop(path="analysis/select_loop.md"):
+    """The reward selection loop, if select_loop.py has been run.
+
+    Read from its own markdown rather than recomputed here: that file already
+    owns the definitions (exact best-of-K, the transfer policy, the
+    selection-on-noise floor) and a second implementation of them in this file
+    is exactly how two numbers under one name happen.
+    """
+    for cand in (path, os.path.join("analysis", os.path.basename(path))):
+        if os.path.exists(cand):
+            return Path(cand).read_text(encoding="utf-8")
+    return ("## Reward selection loop\n\n_analysis/select_loop.md not found "
+            "-- run `python select_loop.py` (needs the pass-1 records; no "
+            "GPU)._\n")
+
+
 def _key_numbers(tidx, s13_stats):
     """The 6-8 numbers a reader actually needs; everything else is detail."""
     L = ["## Key numbers\n"]
@@ -1144,11 +1278,14 @@ def _key_numbers(tidx, s13_stats):
         sup = [r for r in step12 if r["judge"] == j and r["variant"] in SUPERFICIAL]
         if sup:
             w = max(sup, key=lambda r: float(r["signed_delta"]))
-            worst.append(f"{j.split('_')[0]} {float(w['signed_delta']):+.3f}")
+            d = float(w["signed_delta"])
+            worst.append(f"{j.split('_')[0]} {d:+.3f} "
+                         f"({_native(j, d):+.3f} {_unit(j)})")
     if worst:
         L.append(f"- **H2** superficial-cue inflation (worst gap d=dJ-dV per "
-                 f"judge, test, all CI>0): {', '.join(worst)}; videophy2_auto "
-                 f"inflates on every overlay incl. the irrelevant-text control")
+                 f"judge, test, all CI>0, normalised with native in brackets): "
+                 f"{', '.join(worst)}; videophy2_auto inflates on every "
+                 f"overlay incl. the irrelevant-text control")
     idx = [mn for (_j, _v, mn, _lo, _hi) in tidx.get("rows", [])]
     if idx:
         L.append(f"- **H1** temporal-insensitivity index dJ-dH = {min(idx):+.2f} "
@@ -1204,6 +1341,8 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     print("sanity / cards ..."); sanity = _sanity_real() if lean else ""
     cards = _reliability_cards(tidx) if lean else ""
     print("Ablations 10 / 11 ..."); ab = _ablation_10_11() if lean else ""
+    print("selection loop ..."); sel = section_select_loop()
+    legend = _scale_legend()
 
     header = ("# Results\n\n_generated "
               + time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime()) + "_\n\n"
@@ -1211,10 +1350,10 @@ def build(data_dir="analysis/data", skip_sync=False, no_analyze=False,
     keys = _key_numbers(tidx, s13_stats) if lean else ""
 
     if lean:
-        parts = [header, keys, s4, s51, s67, s8, s9_txt, s95, s10, s11_txt,
-                 sanity, s12_txt, s13, ab, cards]
+        parts = [header, keys, legend, s4, s51, s67, s8, s9_txt, s95, s10,
+                 s11_txt, sanity, s12_txt, sel, s13, ab, cards]
     else:
-        parts = [header, s51, s9_txt, s95, s10, s11_txt, s12_txt, s13,
+        parts = [header, legend, s51, s9_txt, s95, s10, s11_txt, s12_txt, sel, s13,
                  "## Steps 6, 7, 8, ablations 10 & 11 - analysis/analyze.py\n\n"
                  "```\n" + analyze_txt.rstrip() + "\n```\n"]
 
@@ -1244,6 +1383,22 @@ def selftest():
     c(abs(lo - 0.1) < 1e-6 and abs(hi - 0.1) < 1e-6, "boot_ci degenerate")
     r = _rankdata([10, 10, 20, 30])
     c(list(r) == [1.5, 1.5, 3.0, 4.0], "rankdata midranks")
+    c(abs(_native("phyjudge_9b", 0.05) - 0.20) < 1e-12,
+      "native rescales by the judge's own span")
+    c(abs(_native("vila_ewm", 0.05) - 0.05) < 1e-12,
+      "vila's booleans are already native")
+    c(_both("videophy2_auto", 0.05) == "+0.050 (+0.200 PC pts)",
+      "_both prints normalised then native")
+    c(_both("videophy2_auto", None) == "--", "_both tolerates a missing value")
+    c(set(NATIVE_SCALE) == set(JUDGES) == set(SCALE_SPAN),
+      "every judge has a native scale and a span")
+    for _j in JUDGES:
+        if NATIVE_SCALE[_j]["hi"] - NATIVE_SCALE[_j]["lo"] != SCALE_SPAN[_j]:
+            c(False, f"NATIVE_SCALE span agrees with SCALE_SPAN ({_j})")
+            break
+    else:
+        c(True, "NATIVE_SCALE span agrees with SCALE_SPAN")
+    c("| judge |" in _scale_legend(), "scale legend renders")
     print("\nSELFTEST", "PASS" if ok else "FAIL")
     return ok
 

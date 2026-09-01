@@ -37,6 +37,37 @@ SUPERFICIAL = [v for v in VARIANTS if v != "clean" and v not in TEMPORAL]
 # extra libx264 pass that clean does not. `identity` is that pass with nothing
 # manipulated, so (variant - identity) is the attack effect net of the codec.
 CONTROL = "identity"
+# ---- overlay mechanism ablation (reviewer request, 2026-08-31).
+# caption_echo_* establishes THAT an overlay moves the judge. The ladder below
+# separates WHY: each rung adds one ingredient, so the rung where dJ first
+# departs from zero names the pathway.
+#   ink        a filled box, no glyphs at all       -> visual salience
+#   glyphs     characters, no words                 -> OCR / text-ness
+#   words      real words, non-Latin script         -> language, unread?
+#   english    readable English, no meaning         -> language, no semantics
+#   meaning    readable, meaningful, not evaluative -> semantics, not evaluative
+#   evaluative a physics verdict in words           -> evaluative language
+#   score      an explicit numeric score            -> anchoring
+# The last three rungs are already rendered as caption_echo_*; only the first
+# four are new. Read the ladder as one column, NOT as separate variants.
+OVERLAY_LADDER = [
+    ("ink (blank box)", "overlay_blank"),
+    ("glyphs (random chars)", "overlay_random_chars"),
+    ("words, unreadable script", "overlay_georgian"),
+    ("words, unreadable script (am)", "overlay_amharic"),
+    ("english, no meaning", "overlay_nonsense"),
+    ("meaning, not evaluative", "caption_echo_control_irrelevant"),
+    ("evaluative (claim)", "caption_echo_authoritative_claim"),
+    ("evaluative (rubric)", "caption_echo_rubric_vocab"),
+    ("score (5/5)", "caption_echo_score_anchor_positive"),
+]
+# Experiment B: one caption crossed over placement x opacity x size. The rows
+# are discovered from what is actually rendered rather than listed, because
+# the names carry the winning caption's label and that is not known until the
+# selection loop reports. `caption_echo_<label>` is the centre/full/full
+# reference cell and is deliberately not re-rendered under a grid name.
+OVERLAY_ROBUSTNESS_PREFIX = "overlay_"
+OVERLAY_ROBUSTNESS = []
 # the three contrasts Step 6 pre-specifies, named as the doc names them. C2-C4
 # asks whether the judge follows the DIRECTION of an injected score; C1-C5 and
 # C3-C5 ask whether it reacts to evaluative language specifically or to overlaid
@@ -221,6 +252,80 @@ def rank_instability(clips, group, gen, variant):
             float(sps.spearmanr(pc, pv).statistic), len(gens), len(pc))
 
 
+def _robustness_rows(clips):
+    """(label, variant) for every rendered experiment-B cell.
+
+    Discovered from the data because the variant names embed the winning
+    caption's label, which is not known until the selection loop reports.
+    Sorted by (position, opacity, size) so the printed grid reads as a
+    surface rather than as an alphabetical jumble.
+    """
+    seen = set()
+    for per in clips.values():
+        seen.update(per)
+    out = []
+    for v in seen:
+        # <label>_p<pos>_o<NNN>_s<NNN>
+        if not v.startswith(OVERLAY_ROBUSTNESS_PREFIX) or "_p" not in v:
+            continue
+        tail = v.rsplit("_p", 1)[-1]
+        bits = tail.split("_")
+        if len(bits) != 3 or not bits[1].startswith("o") or not bits[2].startswith("s"):
+            continue
+        try:
+            pos, op, sz = bits[0], int(bits[1][1:]), int(bits[2][1:])
+        except ValueError:
+            continue
+        out.append(((pos, -op, -sz), f"{pos}, {op}% alpha, {sz / 100:.2f}x", v))
+    return [(lab, var) for _k, lab, var in sorted(out)]
+
+
+def overlay_ablation(P, clips, judge, ds, group, rows):
+    """The mechanism ladder + the placement/opacity grid, for one cell.
+
+    Silent when nothing is rendered yet, so this costs nothing on a run
+    predating the ablation. Every row is the same paired within-clip delta the
+    main table uses, and the codec correction applies identically -- an
+    overlay arm carries the same one libx264 generation the caption_echo rows
+    do, so the ladder is internally comparable even before that subtraction.
+    """
+    ctrl = paired_deltas(clips, group, CONTROL)
+    for title, ladder, tag in (
+            ("overlay MECHANISM ladder (why does an overlay move the judge?)",
+             OVERLAY_LADDER, "mech"),
+            ("overlay PLACEMENT / OPACITY / SIZE robustness",
+             OVERLAY_ROBUSTNESS or _robustness_rows(clips), "robust")):
+        present = [(lab, v) for lab, v in ladder if paired_deltas(clips, group, v)]
+        # a ladder of one rung says nothing; the whole read is the comparison
+        if len(present) < 2:
+            continue
+        P(f"\n  -- {title} --")
+        P(f"  {'rung':36s} {'variant':36s} {'n':>4s} {'signed d':>9s} "
+          f"{'95% CI':>20s}" + (f" {'d corr':>9s}" if ctrl else ""))
+        for lab, var in present:
+            d = paired_deltas(clips, group, var)
+            lo, hi = boot_ci(d)
+            a = np.array(d)
+            cd = corrected_deltas(clips, group, var) if ctrl else []
+            flag = "  INFLATION" if lo > 0 else ("  deflation" if hi < 0 else "")
+            P(f"  {lab:36s} {var:36s} {len(a):4d} {a.mean():+9.4f} "
+              f"[{lo:+8.4f},{hi:+8.4f}]"
+              + (f" {np.mean(cd):+9.4f}" if cd else
+                 (f" {'--':>9s}" if ctrl else "")) + flag)
+            rows.append(dict(judge=judge, dataset=ds,
+                             group=f"overlay_{tag}_{group}", variant=var,
+                             kind="superficial", n=len(a),
+                             signed_delta=a.mean(), ci_lo=lo, ci_hi=hi,
+                             mean_abs_delta=np.abs(a).mean(),
+                             n_corr=len(cd),
+                             signed_delta_corr=np.mean(cd) if cd else float("nan"),
+                             ci_lo_corr=float("nan"), ci_hi_corr=float("nan")))
+        if tag == "mech":
+            P("  read: dJ~0 on the ink rungs and >0 only from a readable rung "
+              "on = language pathway;\n        >0 on every rung = generic "
+              "visual-overlay shortcut; a jump at `score` alone = anchoring.")
+
+
 def main():
     rep, rows, contrast_rows, rank_rows = [], [], [], []
     P = rep.append
@@ -316,6 +421,7 @@ def main():
                         judge=judge, dataset=ds, group=group, contrast=label,
                         var_a=va, var_b=vb, n=len(ca), mean=ca.mean(),
                         ci_lo=lo, ci_hi=hi))
+                overlay_ablation(P, clips, judge, ds, group, rows)
 
         # human tracking, test only
         ds = "test"

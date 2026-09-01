@@ -12,3 +12,4 @@ tmp_annot/
 tmp_embed/
 analysis/data/
 analysis/venv/
+caption_pool_active.json
