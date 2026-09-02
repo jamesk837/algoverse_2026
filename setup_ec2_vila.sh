@@ -129,6 +129,9 @@ if "ps3" not in sys.modules:
     _install("ps3")
 STUBS
 echo "wrote $SITE/sitecustomize.py"
+# the DLAMI ships /usr/lib/python3.x/sitecustomize.py, which shadows the venv
+# copy; a .pth line always runs, so import the stubs under another name
+cp "$SITE/sitecustomize.py" "$SITE/_vila_stubs.py"; echo "import _vila_stubs" > "$SITE/zz_vila_stubs.pth"
 
 "$PY" - <<'VERIFY'
 import importlib, sys

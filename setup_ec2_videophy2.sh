@@ -93,6 +93,9 @@ except Exception:
     pass
 SHIM
 echo "wrote $SITE/sitecustomize.py"
+# the DLAMI ships /usr/lib/python3.x/sitecustomize.py, which shadows the venv
+# copy; a .pth line always runs, so import the stubs under another name
+cp "$SITE/sitecustomize.py" "$SITE/_stubs_videophy2.py"; echo "import _stubs_videophy2" > "$SITE/zz_stubs_videophy2.pth"
 
 "$PY" - <<'VERIFY'
 import importlib, sys

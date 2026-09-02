@@ -649,7 +649,9 @@ def _drawtext(w, h, text, position="centre", opacity=1.0, size=1.0,
     esc = ffmpeg_escape(text)
     fill = f"white@{opacity:g}" if opacity < 1.0 else "white"
     parts = [f"drawtext=fontfile={font}", f"text='{esc}'",
-             f"fontsize={fontsize}"]
+             # expansion=none: with the default expansion a '%' in the text
+             # (even as \% or %%) makes ffmpeg 6.1 draw NOTHING, silently
+             "expansion=none", f"fontsize={fontsize}"]
     if blank:
         # invisible glyphs + a box over their own bbox, filled at the SAME
         # alpha as the text ink it replaces (`fontcolor=white`, i.e. 1.0 by
