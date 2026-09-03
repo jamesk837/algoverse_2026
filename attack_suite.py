@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -165,14 +166,160 @@ def overlay_robustness_set(text, label):
     return out
 
 
-# Placeholder so the module imports before the winner is known. Empty on
-# purpose: rendering a guessed winner would spend the encode and the judge
-# pass on the wrong caption. Populate with overlay_robustness_set(...) once
-# the selection loop reports, then mirror the names into judge_harness.
-OVERLAY_ROBUSTNESS = {}
+# The static arms. Experiment B's grid is NOT here: it is not known until the
+# selection loop reports, and it reaches the render workers through a FILE
+# rather than a module global -- ProcessPoolExecutor workers may fork or
+# spawn, and neither reliably sees a dict assigned in the parent after import.
+#
+# Assigning a module-level OVERLAY_ROBUSTNESS by hand used to be the
+# documented route and it silently rendered NOTHING: both OVERLAY_SPECS and
+# OVERLAY_ROBUSTNESS_ATTACKS were built at import from the empty placeholder,
+# so a later assignment reached neither, and attack_set('overlay_robust')
+# raised an error telling you to do the thing you had just done.
+OVERLAY_SPECS = {**OVERLAY_MECHANISM, **OVERLAY_MECHANISM_OPTIONAL}
 
-OVERLAY_SPECS = {**OVERLAY_MECHANISM, **OVERLAY_MECHANISM_OPTIONAL,
-                 **OVERLAY_ROBUSTNESS}
+OVERLAY_ROBUST_PATH = os.environ.get("OVERLAY_ROBUST_PATH",
+                                     "overlay_robust_active.json")
+_ROBUST_POOL = None
+
+
+def robustness_pool(path=None, reload=False):
+    """{variant_name: _drawtext spec} for experiment B; {} when unset.
+
+    Lazily loaded and cached per process, exactly like search_pool: each pool
+    worker reads the file once. A missing file is {} rather than an error,
+    because every other attack must keep working without one.
+    """
+    global _ROBUST_POOL
+    if _ROBUST_POOL is not None and not reload:
+        return _ROBUST_POOL
+    try:
+        with open(path or OVERLAY_ROBUST_PATH, encoding="utf-8") as fh:
+            _ROBUST_POOL = json.load(fh).get("variants", {})
+    except (OSError, ValueError):
+        _ROBUST_POOL = {}
+    return _ROBUST_POOL
+
+
+# Two name spaces, exactly as the caption search has: the POOL is keyed by the
+# full variant name (`overlay_<label>_p..._o..._s...`, which is what lands in
+# S3, in results/, and in every downstream table), while an attack KEY carries
+# the arm with the family prefix stripped (`overlay:<label>_p..._o..._s...`).
+# out_key_for renders `family:arm` as `family_arm`, so an arm that repeated the
+# family would render as `overlay_overlay_...` -- a file no downstream matcher
+# would recognise. attack_search/search_spec do the same dance for `search:`.
+OVERLAY_PREFIX = "overlay_"
+
+
+def _robust_name(arm):
+    """arm (no family prefix) -> the pool's key, i.e. the variant name."""
+    return arm if arm.startswith(OVERLAY_PREFIX) else OVERLAY_PREFIX + arm
+
+
+def overlay_spec(name):
+    """The _drawtext kwargs for one overlay arm, static or robustness grid.
+
+    `name` is the arm as it arrives from an `overlay:<arm>` attack key: bare
+    for the mechanism arms ("blank"), and the variant name minus its
+    `overlay_` prefix for an experiment-B cell.
+    """
+    spec = OVERLAY_SPECS.get(name)
+    if spec is None:
+        spec = robustness_pool().get(_robust_name(name))
+    if spec is None:
+        raise KeyError(
+            f"unknown overlay arm {name!r}. Mechanism arms are "
+            f"{sorted(OVERLAY_SPECS)}; experiment-B cells come from "
+            f"{OVERLAY_ROBUST_PATH}, written by set_robustness_winner(text) "
+            f"-- the file must be in the working directory of every worker.")
+    return spec
+
+
+def overlay_robust_attacks():
+    """`overlay:<arm>` for every cell in the pinned grid, [] when unset.
+
+    The pool key is the variant name; the attack key strips the family prefix
+    so out_key_for reproduces that same variant name as the filename.
+
+    Re-reads the file rather than trusting the cache: this runs in the PARENT
+    once per run_suite, and a long-lived session that called any pool reader
+    before the pin was written would otherwise hold an empty dict forever.
+    Workers are unaffected -- they load lazily, once each, after the fork.
+    """
+    return [f"overlay:{n[len(OVERLAY_PREFIX):] if n.startswith(OVERLAY_PREFIX) else n}"
+            for n in robustness_pool(reload=True)]
+
+
+def set_robustness_winner(text, label=None, path=None, force=False,
+                          verbose=True):
+    """Pin the selection loop's winning caption and write experiment B's grid.
+
+    This is the WHOLE hand-off: one call turns a winning phrase into the 17
+    cells and prints the two commands that render and score them. `label`
+    defaults to a hash of the text, so a name uniquely determines the caption
+    it was built on -- the same guarantee `search_<hash>` gives, and for the
+    same reason: renders are keyed by NAME and run_suite skips any key that
+    already exists, so a grid rendered under one caption and later read as
+    another is not recoverable after the fact.
+
+    Refuses to overwrite an existing file without force, like init_pool and
+    freeze_subset: the file is the record of which caption the grid tests.
+    """
+    label = label or (OVERLAY_PREFIX + "win_"
+                      + hashlib.sha256(text.encode("utf-8")).hexdigest()[:8])
+    if not label.startswith(OVERLAY_PREFIX):
+        # every downstream matcher keys on it: judge_harness's shape test,
+        # analyze._robustness_rows, and the overlay_ file naming itself
+        label = OVERLAY_PREFIX + label
+    path = path or OVERLAY_ROBUST_PATH
+    if os.path.exists(path) and not force:
+        with open(path, encoding="utf-8") as fh:
+            cur = json.load(fh)
+        raise SystemExit(
+            f"{path} already pins {cur.get('text')!r} as {cur.get('label')!r}. "
+            f"Pass force=True only if nothing has been rendered under that "
+            f"label yet -- renders are keyed by name and are never re-made.")
+    grid = overlay_robustness_set(text, label)
+    payload = {"generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                              time.gmtime()),
+               "text": text, "label": label, "variants": grid}
+    Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+    robustness_pool(path=path, reload=True)
+    if not verbose:
+        return grid
+    print(f"wrote {path}")
+    print(f"  caption: {text!r}")
+    print(f"  label:   {label}")
+    print(f"  cells:   {len(grid)} (centre/full/full is skipped -- it already "
+          f"exists as that caption's own overlay)")
+    checked = check_font(grid, verbose=False)
+    bad = [n for n, ok in checked.items() if ok is False]
+    unknown = [n for n, ok in checked.items() if ok is None]
+    if bad:
+        print(f"  FAIL the font cannot draw this caption ({len(bad)} cells); "
+              f"it would render as boxes, i.e. as the `blank` arm")
+        return grid
+    if unknown:
+        print(f"  font:    NOT CHECKED -- could not read "
+              f"{font_for(next(iter(grid.values())))}. Re-run this on the "
+              f"render box before spending the encodes.")
+    else:
+        print("  font:    ok")
+    names = " ".join(sorted(grid))
+    print("\n# 1 -- RENDER (CPU, minutes). Run from THIS directory: the file")
+    print("#      above is what the render workers read.")
+    print('python -c "')
+    print("from attack_suite import run_suite, pass2_stems")
+    print("for ds in ('test','implausibench_implausible','implausibench_real'):")
+    print("    run_suite(dataset=ds, limit_clips=None, num_workers=8,")
+    print("              attacks='overlay_robust', only_stems=pass2_stems(ds))\"")
+    print("\n# 2 -- JUDGE, pass-1 mode. No stem argument is needed: naming the")
+    print("#      variants routes through clips_with_variants, which requires")
+    print("#      each one to be RENDERED, and they were rendered only on 120.")
+    print(f'VARIANTS="clean {names}" \\')
+    print("  N=120 ./run_shard.sh 0 1")
+    return grid
 
 # ----------------------------------------------------------------------
 # The caption SEARCH pool (caption_search.py).
@@ -250,7 +397,9 @@ CONTROL_ATTACKS = ["identity"]
 # that length. Same reasoning as CONTROL_ATTACKS.
 OVERLAY_MECHANISM_ATTACKS = [f"overlay:{n}" for n in OVERLAY_MECHANISM]
 OVERLAY_OPTIONAL_ATTACKS = [f"overlay:{n}" for n in OVERLAY_MECHANISM_OPTIONAL]
-OVERLAY_ROBUSTNESS_ATTACKS = [f"overlay:{n}" for n in OVERLAY_ROBUSTNESS]
+# Experiment B's cells are read from the pool file at CALL time; see
+# overlay_robust_attacks(). None of it can be a module constant, because
+# the grid is not known until the selection loop reports a winner.
 
 # The pass-2 subset is the clip list both overlay experiments run on. It is
 # small (120 clips: 80 test, 25 implausibench_implausible, 15
@@ -599,7 +748,8 @@ def check_font(specs=None, verbose=True):
     parsed, which is a warning rather than a failure; False means the glyphs
     are genuinely absent and the arm would render as boxes.
     """
-    specs = specs if specs is not None else OVERLAY_SPECS
+    if specs is None:
+        specs = {**OVERLAY_SPECS, **robustness_pool()}
     out = {}
     for name, spec in specs.items():
         path = font_for(spec)
@@ -680,7 +830,7 @@ def attack_overlay(inp, out, name):
     the `blank` arm sitting next to it in the ladder -- a silent collapse of
     two rungs into one.
     """
-    spec = OVERLAY_SPECS[name]
+    spec = overlay_spec(name)
     miss = missing_glyphs(spec.get("text", ""), font_for(spec))
     if miss:
         raise RuntimeError(
@@ -861,7 +1011,7 @@ def stray_controls(dataset, delete=False, attacks=None):
     Lists by default. Pass delete=True to remove them.
     """
     attacks = attacks or (CONTROL_ATTACKS + OVERLAY_MECHANISM_ATTACKS
-                          + OVERLAY_ROBUSTNESS_ATTACKS)
+                          + overlay_robust_attacks())
     curated = rendered_stems(dataset)
     prefix = f"attacks/{dataset}/"
     controls = attack_filenames(attacks)
@@ -900,11 +1050,11 @@ ATTACK_SETS = {
     "overlay": lambda: list(OVERLAY_MECHANISM_ATTACKS),
     # opt-in Ethiopic arm; needs a font with Ethiopic coverage installed
     "overlay_amharic": lambda: list(OVERLAY_OPTIONAL_ATTACKS),
-    # experiment B: the placement x opacity x size grid. Empty until the
-    # selection loop names a winner and OVERLAY_ROBUSTNESS is populated.
-    "overlay_robust": lambda: list(OVERLAY_ROBUSTNESS_ATTACKS),
+    # experiment B: the placement x opacity x size grid. Read from the pool
+    # file at call time -- empty until set_robustness_winner() pins a caption.
+    "overlay_robust": lambda: overlay_robust_attacks(),
     "all": lambda: (ATTACKS_2X2 + list(CONTROL_ATTACKS)
-                    + OVERLAY_MECHANISM_ATTACKS + OVERLAY_ROBUSTNESS_ATTACKS),
+                    + OVERLAY_MECHANISM_ATTACKS + overlay_robust_attacks()),
 }
 
 
@@ -923,10 +1073,10 @@ def attack_set(name="2x2"):
     got = ATTACK_SETS[name]()
     if not got:
         raise ValueError(
-            f"attack set {name!r} is empty. If this is 'overlay_robust', the "
-            f"selection loop has not named a winner yet -- populate "
-            f"OVERLAY_ROBUSTNESS with overlay_robustness_set(text, label) "
-            f"first, and mirror the names into judge_harness.")
+            f"attack set {name!r} is empty. If this is 'overlay_robust', no "
+            f"winning caption is pinned yet: run "
+            f"set_robustness_winner('<the winning caption>') to write "
+            f"{OVERLAY_ROBUST_PATH}, then render from that same directory.")
     return got
 
 
@@ -995,7 +1145,7 @@ def run_suite(dataset="test", limit_clips=1, num_workers=NUM_WORKERS,
 
     # font preflight: a script the font cannot draw renders as tofu boxes and
     # uploads perfectly happily, so check before spending the encodes
-    ov = {a.split(":", 1)[1]: OVERLAY_SPECS[a.split(":", 1)[1]]
+    ov = {a.split(":", 1)[1]: overlay_spec(a.split(":", 1)[1])
           for a in all_attacks if a.startswith("overlay:")}
     ov.update({a.split(":", 1)[1]: search_spec(a.split(":", 1)[1])
                for a in all_attacks if a.startswith("search:")})

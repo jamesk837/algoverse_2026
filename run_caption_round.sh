@@ -3,12 +3,24 @@
 #
 #   ./run_caption_round.sh <round>      # e.g. 0, 1, 2
 #   ./run_caption_round.sh final        # the winners, on the eval subset
-#   ./run_caption_round.sh ladder       # the overlay MECHANISM ablation
+#   ./run_caption_round.sh ladder       # overlay experiment A -- MECHANISM
+#   ./run_caption_round.sh robust "<winning caption>"   # experiment B
 #
-# `ladder` is a different experiment (blank box / random chars / georgian /
-# nonsense, on the pass-2 subset) but it is the same render-then-judge shape
-# and the same venv preflight, so it lives here rather than in a second script
-# with a second copy of the health checks.
+# `ladder` and `robust` are different experiments (A: blank box / random chars
+# / georgian / nonsense; B: one caption crossed over placement x opacity x
+# size) but both are the same render-then-judge shape on the same pass-2
+# subset and the same venv preflight, so they live here rather than in a
+# second script with a second copy of the health checks.
+#
+# `robust` takes the winning caption as its second argument the FIRST time and
+# pins it to overlay_robust_active.json; later runs re-read the pin and the
+# argument becomes optional. Passing a caption that differs from the pinned
+# one is an error rather than a silent repin: renders are keyed by name and
+# are never re-made, so a grid half-rendered under two captions cannot be
+# untangled afterwards.
+#
+# SMOKE=<n> does the whole thing on n clips per dataset (default 2) -- the
+# same code path end to end, minutes instead of hours.
 #
 # The two halves need different environments -- rendering wants ffmpeg and
 # opencv, scoring wants one of three mutually-pinned judge venvs -- which is
@@ -35,12 +47,27 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 ROUND="${1:-}"
-[ -n "$ROUND" ] || { echo "usage: $0 <round|final|ladder>" >&2; exit 1; }
+CAPTION_ARG="${2:-${OVERLAY_CAPTION:-}}"
+[ -n "$ROUND" ] \
+  || { echo "usage: $0 <round|final|ladder|robust> [caption]" >&2; exit 1; }
 case "$ROUND" in
-  final|ladder|[0-9]|[0-9][0-9]) ;;
-  *) echo "ERROR: target must be an integer, 'final' or 'ladder', got '$ROUND'" >&2
+  final|ladder|robust|[0-9]|[0-9][0-9]) ;;
+  *) echo "ERROR: target must be an integer, 'final', 'ladder' or 'robust', got '$ROUND'" >&2
      exit 1 ;;
 esac
+
+# SMOKE=<n> renders and scores only the first n clips per dataset (SMOKE=1
+# means 2, which is the useful floor -- one clip cannot show a spread). The
+# judge half needs no matching cap: naming the variants routes through
+# clips_with_variants, which requires each one to be RENDERED, so it can only
+# ever see the clips the smoke render produced.
+SMOKE_N="${SMOKE:-}"
+[ "$SMOKE_N" = "1" ] && SMOKE_N=2
+case "$SMOKE_N" in
+  ''|*[!0-9]*) [ -z "$SMOKE_N" ] || { echo "SMOKE must be a number" >&2; exit 1; } ;;
+esac
+export SMOKE_N
+[ -z "$SMOKE_N" ] || echo "SMOKE MODE: $SMOKE_N clip(s) per dataset"
 
 RENDER_VENV="${RENDER_VENV:-$HOME/venvs/render}"
 RENDER_WORKERS="${RENDER_WORKERS:-8}"
@@ -50,10 +77,11 @@ mkdir -p "$LOGS"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-if [ "$ROUND" != "ladder" ]; then
-  [ -f caption_pool.json ] \
-    || die "caption_pool.json missing -- run: python caption_search.py --init"
-fi
+case "$ROUND" in
+  ladder|robust) ;;   # the overlay experiments do not read the search pool
+  *) [ -f caption_pool.json ] \
+       || die "caption_pool.json missing -- run: python caption_search.py --init" ;;
+esac
 
 # ---- render venv -----------------------------------------------------------
 # Deliberately its own venv rather than borrowing a judge's. Only vila installs
@@ -102,6 +130,39 @@ import boto3
 boto3.client('sts', region_name='us-east-1').get_caller_identity()" >/dev/null \
   || die "no AWS credentials -- is the IAM instance profile attached?"
 
+# ---- pin the experiment-B caption ------------------------------------------
+# Before the render, so a missing or contradictory caption costs nothing. The
+# pin FILE is what the render workers read: a module global would not survive a
+# ProcessPoolExecutor worker that spawns rather than forks.
+if [ "$ROUND" = "robust" ]; then
+  OVERLAY_CAPTION="$CAPTION_ARG" FORCE_PIN="${FORCE_PIN:-}" \
+    "$RENDER_VENV/bin/python" -u -c '
+import json, os
+import attack_suite as A
+
+text = os.environ.get("OVERLAY_CAPTION") or ""
+path = A.OVERLAY_ROBUST_PATH
+if os.path.exists(path) and not os.environ.get("FORCE_PIN"):
+    with open(path, encoding="utf-8") as fh:
+        cur = json.load(fh)
+    if text and cur["text"] != text:
+        raise SystemExit(
+            "ERROR: %s already pins %r as %s.\n"
+            "Re-run with no caption argument to use it, or set FORCE_PIN=1 "
+            "ONLY if nothing has been rendered under that label yet."
+            % (path, cur["text"], cur["label"]))
+    print("pinned already: %r  (%s, %d cells)"
+          % (cur["text"], cur["label"], len(cur["variants"])))
+elif text:
+    grid = A.set_robustness_winner(text, force=True, verbose=False)
+    print("pinned: %r  (%d cells) -> %s" % (text, len(grid), path))
+else:
+    raise SystemExit(
+        "ERROR: no caption pinned and none given. Pass the selection loop "
+        "winner as the second argument.")' \
+    || die "could not pin the experiment-B caption"
+fi
+
 # ---- render ----------------------------------------------------------------
 RLOG="$LOGS/caption_render_${ROUND}.log"
 if [ -n "${SKIP_RENDER:-}" ]; then
@@ -123,6 +184,23 @@ if bad:
 for ds in ('test', 'implausibench_implausible', 'implausibench_real'):
     run_suite(dataset=ds, limit_clips=None, num_workers=$RENDER_WORKERS,
               attacks='overlay', only_stems=pass2_stems(ds))" 2>&1 | tee "$RLOG"
+  elif [ "$ROUND" = "robust" ]; then
+    # experiment B, on the same pass-2 subset as the ladder. check_font covers
+    # the pinned grid as well as the static arms, so a caption the font cannot
+    # draw is caught here instead of discovered as 2040 boxes.
+    "$RENDER_VENV/bin/python" -u -c "
+import os
+from attack_suite import run_suite, pass2_stems, check_font
+bad = [n for n, ok in check_font(verbose=False).items() if ok is False]
+if bad:
+    raise SystemExit('font cannot draw: %s' % ', '.join(bad))
+n = int(os.environ.get('SMOKE_N') or 0)
+for ds in ('test', 'implausibench_implausible', 'implausibench_real'):
+    stems = sorted(pass2_stems(ds))
+    if n:
+        stems = stems[:n]
+    run_suite(dataset=ds, limit_clips=None, num_workers=$RENDER_WORKERS,
+              attacks='overlay_robust', only_stems=stems)" 2>&1 | tee "$RLOG"
   elif [ "$ROUND" = "final" ]; then
     "$RENDER_VENV/bin/python" -u caption_search.py --finalize \
       --workers "$RENDER_WORKERS" 2>&1 | tee "$RLOG"
@@ -162,6 +240,23 @@ print('CAPTION_VARIANTS=\"%s\"' % ' '.join(['clean'] + names))
 print('CAPTION_N=%d' % max(len(v) for v in stems.values()))
 print('CAPTION_NVARIANTS=%d' % len(names))
 print('CAPTION_TOTAL_CLIPS=%d' % sum(len(v) for v in stems.values()))")"
+elif [ "$ROUND" = "robust" ]; then
+  # Derived from the pin file rather than spelled out here: the cell names
+  # embed a hash of the caption, which is exactly what should never be retyped.
+  ENVOUT="$("$RENDER_VENV/bin/python" -c "
+import os
+import attack_suite as A
+names = sorted(A.robustness_pool(reload=True))
+if not names:
+    raise SystemExit(1)
+dss = ('test', 'implausibench_real', 'implausibench_implausible')
+n = int(os.environ.get('SMOKE_N') or 0)
+stems = {d: (sorted(A.pass2_stems(d))[:n] if n else A.pass2_stems(d)) for d in dss}
+print('CAPTION_LABEL=\"overlay presentation robustness\"')
+print('CAPTION_VARIANTS=\"%s\"' % ' '.join(['clean'] + names))
+print('CAPTION_N=%d' % max(len(v) for v in stems.values()))
+print('CAPTION_NVARIANTS=%d' % len(names))
+print('CAPTION_TOTAL_CLIPS=%d' % sum(len(v) for v in stems.values()))")"
 else
   ENVOUT="$("$RENDER_VENV/bin/python" caption_search.py --emit-env "$ROUND")"
 fi
@@ -195,8 +290,8 @@ if [ "$rc" -eq 0 ]; then
   echo "$ROUND done. Next:"
   if [ "$ROUND" = "final" ]; then
     echo "  python caption_search.py --report --push"
-  elif [ "$ROUND" = "ladder" ]; then
-    echo "  python analysis/analyze.py     # prints the mechanism ladder table"
+  elif [ "$ROUND" = "ladder" ] || [ "$ROUND" = "robust" ]; then
+    echo "  python analysis/analyze.py     # prints the overlay ablation tables"
   else
     echo "  python caption_search.py --rank $ROUND"
     echo "  ...then add round $((ROUND + 1)) to caption_pool.json and re-run this."

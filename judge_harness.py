@@ -244,10 +244,25 @@ OVERLAY_MECHANISM_FILES = [
 OVERLAY_OPTIONAL_FILES = ["overlay_amharic"]
 
 # B -- PRESENTATION robustness: one caption (the selection loop's winner)
-# crossed over placement x opacity x size. DEFERRED until that winner is
-# known; populate from attack_suite.overlay_robustness_set(text, label) and
-# mirror the generated names here.
+# crossed over placement x opacity x size. The winner is not known until the
+# selection loop reports, so like the caption-search variants these CANNOT be
+# enumerated here and are matched by SHAPE instead of by a hand-mirrored list.
+#
+# The shape is what keeps that safe. A cell name carries its whole
+# configuration -- <label>_p<position>_o<opacity>_s<size>, where the label is
+# a hash of the caption -- so an unknown match can only ever be a cell this
+# repo rendered, never a typo that quietly scores the wrong video. Mirroring
+# a list by hand was the alternative, and it is exactly the failure mode the
+# ATTACK_FILES duplication already warns about: the render side and the judge
+# side drift and the attacks/<dataset>/<clip_stem>/ lookup silently misses.
+# attack_suite.set_robustness_winner() generates names of this shape.
 OVERLAY_ROBUSTNESS_FILES = []
+OVERLAY_ROBUST_RE = re.compile(
+    r"^overlay_[a-z0-9_]+_p(?:centre|br|bottom)_o\d{3}_s\d{3}$")
+
+
+def is_robustness_variant(name):
+    return bool(OVERLAY_ROBUST_RE.match(name))
 
 OVERLAY_FILES = OVERLAY_MECHANISM_FILES + OVERLAY_ROBUSTNESS_FILES
 
@@ -1362,7 +1377,7 @@ def results_frame(records):
     # column for an entire search round.
     _cats = ALL_VARIANTS + sorted(
         {v for v in df["variant"].unique() if isinstance(v, str)
-         and v.startswith(SEARCH_PREFIX)})
+         and (v.startswith(SEARCH_PREFIX) or is_robustness_variant(v))})
     df["variant"] = pd.Categorical(df["variant"], categories=_cats,
                                    ordered=True)
     return df.sort_values(["clip", "model", "variant", "call"]).reset_index(drop=True)
@@ -1429,7 +1444,8 @@ def run_judges(dataset="test", num_clips=1, push_to_s3=True, models=None,
     if variants is not None:
         variants = list(variants)
         unknown = [v for v in variants if v not in ALL_VARIANTS
-                   and not v.startswith(SEARCH_PREFIX)]
+                   and not v.startswith(SEARCH_PREFIX)
+                   and not is_robustness_variant(v)]
         if unknown:
             raise ValueError(f"unknown variant(s) {unknown}; "
                              f"expected a subset of {ALL_VARIANTS}")

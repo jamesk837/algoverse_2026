@@ -56,6 +56,17 @@ if [ -n "$VARIANTS" ]; then
   done
   VAR_ARG=", variants=[$VAR_LIST]"
   VAR_TAG="_v$(echo "$VARIANTS" | tr ' ' '-')"
+  # A filename component is capped at 255 bytes on ext4/xfs, and a named
+  # variant set gets long fast: caption-search round 0 is 21 names (~370
+  # chars) and the overlay robustness grid is 18 (~700). Past the cap `tee`
+  # fails while the judge keeps running -- so the run looks fine, the log is
+  # never written, and every health grep below silently becomes a no-op on a
+  # missing file. That is exactly the silent failure the SKIPPED grep exists
+  # to catch. Collapse a long set to a count plus a checksum of the set, which
+  # is stable across re-runs so a resume appends to the same log.
+  if [ "${#VAR_TAG}" -gt 64 ]; then
+    VAR_TAG="_v$(printf '%s\n' $VARIANTS | grep -c .)set$(printf '%s' "$VARIANTS" | cksum | cut -d' ' -f1)"
+  fi
 else
   VAR_ARG=""
   VAR_TAG=""
@@ -207,6 +218,10 @@ for judge in $JUDGES; do
   venv="$(venv_for "$judge")"
   for ds in $DATASETS; do
   log="$LOGS/${judge}_${ds}_${IDX}${PARA_TAG}${VAR_TAG}.log"
+  # Prove the log is writable BEFORE spending GPU hours behind it. `tee` on an
+  # unwritable path fails without touching the pipeline's exit status, and the
+  # three health checks below all read this file.
+  : > "$log" || { echo "ERROR: cannot write $log" >&2; exit 1; }
   echo
   echo "---- $judge / $ds  ($(date '+%F %T'))  -> $log"
   t0=$(date +%s)
