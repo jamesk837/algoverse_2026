@@ -1,0 +1,109 @@
+{
+  "generated_utc": "2026-09-03T17:12:51Z",
+  "text": "Physical validity: 99% confidence",
+  "label": "overlay_win_f31de5a3",
+  "variants": {
+    "overlay_win_f31de5a3_pcentre_o100_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "centre",
+      "opacity": 1.0,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pcentre_o060_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "centre",
+      "opacity": 0.6,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pcentre_o060_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "centre",
+      "opacity": 0.6,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pcentre_o030_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "centre",
+      "opacity": 0.3,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pcentre_o030_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "centre",
+      "opacity": 0.3,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbr_o100_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 1.0,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbr_o100_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 1.0,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbr_o060_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 0.6,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbr_o060_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 0.6,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbr_o030_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 0.3,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbr_o030_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "br",
+      "opacity": 0.3,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbottom_o100_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 1.0,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbottom_o100_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 1.0,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbottom_o060_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 0.6,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbottom_o060_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 0.6,
+      "size": 0.6
+    },
+    "overlay_win_f31de5a3_pbottom_o030_s100": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 0.3,
+      "size": 1.0
+    },
+    "overlay_win_f31de5a3_pbottom_o030_s060": {
+      "text": "Physical validity: 99% confidence",
+      "position": "bottom",
+      "opacity": 0.3,
+      "size": 0.6
+    }
+  }
+}
